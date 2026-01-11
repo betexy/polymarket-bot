@@ -561,6 +561,65 @@ async def dashboard_page():
             }
         };
         
+        // График профита
+        let profitChart = null;
+        
+        function updateProfitChart(profitData) {
+            const ctx = document.getElementById('profitChart');
+            if (!ctx || !window.Chart) return;
+            
+            const labels = profitData.map(d => {
+                const date = new Date(d.date);
+                return date.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' });
+            });
+            
+            // Рассчитываем накопленный профит
+            let cumulativeProfit = 0;
+            const cumulativeProfits = profitData.map(d => {
+                cumulativeProfit += d.profit || 0;
+                return cumulativeProfit;
+            });
+            
+            if (profitChart) {
+                profitChart.destroy();
+            }
+            
+            profitChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Накопленный профит (USD)',
+                        data: cumulativeProfits,
+                        borderColor: '#3b82f6',
+                        backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                        tension: 0.4,
+                        fill: true
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'top'
+                        }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: false,
+                            ticks: {
+                                callback: function(value) {
+                                    return value.toFixed(2) + ' USD';
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        
         // Загружаем данные при загрузке страницы
         loadData();
         

@@ -107,10 +107,15 @@ class PolymarketCLOBClient:
                     logger.info("CLOB client initialized with existing API credentials")
                 except Exception as e:
                     logger.warning(f"Failed to set API credentials: {e}. Will create/derive new ones.")
-                    # Создаем или получаем API ключи
-                    api_creds = self._client.create_or_derive_api_creds()
-                    self._client.set_api_creds(api_creds)
-                    logger.info("CLOB client initialized with new API credentials")
+                    try:
+                        # Создаем или получаем API ключи
+                        api_creds = self._client.create_or_derive_api_creds()
+                        self._client.set_api_creds(api_creds)
+                        logger.info("CLOB client initialized with new API credentials")
+                    except Exception as e2:
+                        logger.error(f"Failed to create/derive API credentials: {e2}")
+                        # Продолжаем без API ключей (клиент может работать без них для некоторых операций)
+                        logger.warning("CLOB client initialized without API credentials")
             else:
                 # Создаем или получаем API ключи
                 api_creds = self._client.create_or_derive_api_creds()
