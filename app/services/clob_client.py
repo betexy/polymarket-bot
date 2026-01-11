@@ -1,0 +1,454 @@
+import logging
+from typing import Optional, Dict, Any
+from app.config.settings import Settings
+
+logger = logging.getLogger(__name__)
+
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client import clob_types
+    import py_clob_client.http_helpers.helpers as http_helpers
+    import httpx
+    CLOB_AVAILABLE = True
+except ImportError:
+    CLOB_AVAILABLE = False
+    logger.warning("py-clob-client not installed. CLOB functionality will be disabled.")
+
+
+class PolymarketCLOBClient:
+    """
+    Клиент для работы с Polymarket CLOB API
+    
+    Использует официальную библиотеку py-clob-client для размещения ордеров
+    """
+    
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self._client: Optional[ClobClient] = None
+        self._initialized = False
+        
+        if not CLOB_AVAILABLE:
+            logger.error("py-clob-client not available. Install with: pip install py-clob-client")
+            return
+        
+        if not settings.polymarket_private_key:
+            logger.warning("Private key not configured. CLOB client will not be initialized.")
+            return
+        
+        # Настраиваем прокси для HTTP клиента py-clob-client
+        self._setup_proxy()
+        
+        self._initialize_client()
+    
+    def _setup_proxy(self) -> None:
+        """Настройка прокси для py-clob-client HTTP клиента"""
+        if not CLOB_AVAILABLE:
+            return
+            
+        if not self.settings.polymarket_clob_proxy:
+            logger.info("No proxy configured for CLOB API")
+            return
+        
+        try:
+            # Форматируем прокси URL
+            proxy_url = self.settings.polymarket_clob_proxy
+            if not proxy_url.startswith('http://') and not proxy_url.startswith('https://'):
+                # Если формат username:password@host:port, добавляем http://
+                if '@' in proxy_url:
+                    proxy_url = f"http://{proxy_url}"
+                else:
+                    proxy_url = f"http://{proxy_url}"
+            
+            logger.info(f"Setting up proxy for CLOB API: {proxy_url.split('@')[1] if '@' in proxy_url else proxy_url}")
+            
+            # Патчим глобальный httpx клиент в py-clob-client
+            # py-clob-client использует глобальный _http_client = httpx.Client(http2=True)
+            # Пересоздаем его с прокси
+            old_client = http_helpers._http_client
+            http_helpers._http_client = httpx.Client(
+                http2=True,
+                proxy=proxy_url,  # httpx использует proxy (единственное число)
+                timeout=30.0
+            )
+            
+            # Закрываем старый клиент
+            try:
+                old_client.close()
+            except:
+                pass
+            
+            logger.info("Proxy configured successfully for CLOB API")
+            
+        except Exception as e:
+            logger.error(f"Failed to setup proxy: {e}", exc_info=True)
+    
+    def _initialize_client(self) -> None:
+        """Инициализация CLOB клиента"""
+        try:
+            # Создаем клиент с приватным ключом
+            self._client = ClobClient(
+                host=self.settings.polymarket_clob_host,
+                chain_id=self.settings.polymarket_chain_id,
+                key=self.settings.polymarket_private_key
+            )
+            
+            # Если есть API ключи, используем их
+            if (self.settings.polymarket_api_key and 
+                self.settings.polymarket_api_secret and 
+                self.settings.polymarket_api_passphrase):
+                try:
+                    # Создаем ApiCreds объект напрямую
+                    api_creds = clob_types.ApiCreds(
+                        api_key=self.settings.polymarket_api_key,
+                        api_secret=self.settings.polymarket_api_secret,
+                        api_passphrase=self.settings.polymarket_api_passphrase
+                    )
+                    self._client.set_api_creds(api_creds)
+                    logger.info("CLOB client initialized with existing API credentials")
+                except Exception as e:
+                    logger.warning(f"Failed to set API credentials: {e}. Will create/derive new ones.")
+                    # Создаем или получаем API ключи
+                    api_creds = self._client.create_or_derive_api_creds()
+                    self._client.set_api_creds(api_creds)
+                    logger.info("CLOB client initialized with new API credentials")
+            else:
+                # Создаем или получаем API ключи
+                api_creds = self._client.create_or_derive_api_creds()
+                self._client.set_api_creds(api_creds)
+                logger.info("CLOB client initialized with derived API credentials")
+            
+            self._initialized = True
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize CLOB client: {e}", exc_info=True)
+            self._client = None
+            self._initialized = False
+    
+    def is_available(self) -> bool:
+        """Проверка доступности CLOB клиента"""
+        return CLOB_AVAILABLE and self._initialized and self._client is not None
+    
+    def create_order(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        side: str = "BUY"  # "BUY" or "SELL"
+    ) -> Dict[str, Any]:
+        """
+        Размещение ордера на Polymarket
+        
+        Args:
+            token_id: ID токена (outcome token) из market
+            price: Цена от 0.01 до 0.99 (0.50 = 50% вероятность)
+            size: Размер ордера (в токенах)
+            side: "BUY" или "SELL"
+        
+        Returns:
+            Ответ от API с информацией об ордере (включая orderID)
+        
+        Raises:
+            Exception: Если клиент не инициализирован или произошла ошибка
+        """
+        if not self.is_available():
+            raise Exception("CLOB client is not available or not initialized")
+        
+        try:
+            logger.info(f"Creating order: token_id={token_id}, price={price}, size={size}, side={side}")
+            
+            # Создаем OrderArgs объект
+            order_args = clob_types.OrderArgs(
+                token_id=token_id,
+                price=float(price),  # Цена как float
+                size=float(size),    # Размер как float
+                side=side.upper()    # "BUY" или "SELL"
+            )
+            
+            # Используем create_and_post_order для создания и отправки ордера за один раз
+            response = self._client.create_and_post_order(order_args)
+            
+            # response может быть dict или другой тип
+            if isinstance(response, dict):
+                order_id = response.get('orderID') or response.get('order_id') or response.get('id')
+            elif hasattr(response, 'orderID'):
+                order_id = response.orderID
+            elif hasattr(response, 'dict'):
+                # Если это объект с методом dict()
+                order_dict = response.dict()
+                order_id = order_dict.get('orderID') or order_dict.get('order_id') or order_dict.get('id')
+            else:
+                order_id = str(response)
+            
+            logger.info(f"Order created and posted successfully: {order_id}")
+            # Преобразуем response в словарь для удобства
+            if isinstance(response, dict):
+                return response
+            elif hasattr(response, 'dict'):
+                return response.dict()
+            else:
+                return {"orderID": order_id, "response": str(response)} if order_id else {"response": str(response)}
+            
+        except Exception as e:
+            logger.error(f"Error creating order: {e}", exc_info=True)
+            raise
+    
+    def cancel_order(self, order_id: str) -> Dict[str, Any]:
+        """
+        Отмена ордера
+        
+        Args:
+            order_id: ID ордера для отмены
+        
+        Returns:
+            Ответ от API
+        """
+        if not self.is_available():
+            raise Exception("CLOB client is not available or not initialized")
+        
+        try:
+            logger.info(f"Canceling order: {order_id}")
+            response = self._client.cancel_order(order_id=order_id)
+            logger.info(f"Order canceled: {order_id}")
+            return response
+        except Exception as e:
+            logger.error(f"Error canceling order: {e}", exc_info=True)
+            raise
+    
+    def get_order(self, order_id: str) -> Dict[str, Any]:
+        """
+        Получение информации об ордере
+        
+        Args:
+            order_id: ID ордера
+        
+        Returns:
+            Информация об ордере
+        """
+        if not self.is_available():
+            raise Exception("CLOB client is not available or not initialized")
+        
+        try:
+            return self._client.get_order(order_id=order_id)
+        except Exception as e:
+            logger.error(f"Error getting order: {e}", exc_info=True)
+            raise
+    
+    def get_orders(self) -> list[Dict[str, Any]]:
+        """
+        Получение списка всех открытых ордеров
+        
+        Returns:
+            Список ордеров
+        """
+        if not self.is_available():
+            raise Exception("CLOB client is not available or not initialized")
+        
+        try:
+            return self._client.get_orders()
+        except Exception as e:
+            logger.error(f"Error getting orders: {e}", exc_info=True)
+            raise
+    
+    def get_positions(self) -> list[Dict[str, Any]]:
+        """
+        Получение позиций
+        
+        Returns:
+            Список позиций
+        """
+        if not self.is_available():
+            raise Exception("CLOB client is not available or not initialized")
+        
+        try:
+            return self._client.get_positions()
+        except Exception as e:
+            logger.error(f"Error getting positions: {e}", exc_info=True)
+            raise
+    
+    def get_balance(self) -> Dict[str, Any]:
+        """
+        Получение баланса
+        
+        Returns:
+            Информация о балансе
+        """
+        if not self.is_available():
+            raise Exception("CLOB client is not available or not initialized")
+        
+        try:
+            return self._client.get_balance()
+        except Exception as e:
+            logger.error(f"Error getting balance: {e}", exc_info=True)
+            raise
+    
+    def get_token_id_from_market(
+        self,
+        market_data: Dict[str, Any],
+        outcome: str = "YES"  # "YES", "NO", или индекс/название outcome
+    ) -> Optional[str]:
+        """
+        Извлечение token_id из market данных
+        
+        Args:
+            market_data: Данные market из Gamma API
+            outcome: Название или индекс outcome ("YES", "NO", "0", "1", etc.)
+        
+        Returns:
+            token_id или None если не найден
+        """
+        # Ищем tokens в разных форматах
+        # В Polymarket API tokens могут быть в разных полях:
+        # - tokens (массив объектов с token_id)
+        # - outcomeTokens (массив объектов)
+        # - clobTokenIds (массив строк с token_id для CLOB)
+        # - outcomes (массив строк или JSON строка)
+        tokens = market_data.get("tokens") or market_data.get("outcomeTokens")
+        clob_token_ids = market_data.get("clobTokenIds")
+        outcomes = market_data.get("outcomes", [])
+        
+        # Если есть clobTokenIds (это token_id для CLOB), используем их
+        if clob_token_ids:
+            if isinstance(clob_token_ids, str):
+                try:
+                    import json
+                    clob_token_ids = json.loads(clob_token_ids)
+                except (json.JSONDecodeError, ValueError):
+                    logger.warning(f"Could not parse clobTokenIds as JSON: {clob_token_ids}")
+                    clob_token_ids = []
+            
+            if isinstance(clob_token_ids, list) and len(clob_token_ids) > 0:
+                logger.warning(f"   [TOKEN_SEARCH] Found clobTokenIds: {clob_token_ids}")
+                # Создаем структуру tokens из clobTokenIds для совместимости
+                if not tokens or not isinstance(tokens, list):
+                    tokens = [{"token_id": tid, "id": tid} for tid in clob_token_ids]
+                    logger.warning(f"   [TOKEN_SEARCH] Created tokens structure from clobTokenIds")
+        
+        # НЕ используем outcomes как fallback для tokens, т.к. outcomes - это названия, а не token_id
+        # Если tokens все еще нет после обработки clobTokenIds, значит их нет в данных
+        
+        # Если outcomes - строка JSON, парсим её
+        if isinstance(outcomes, str):
+            try:
+                import json
+                outcomes = json.loads(outcomes)
+            except (json.JSONDecodeError, ValueError):
+                logger.warning(f"Could not parse outcomes as JSON: {outcomes}")
+                outcomes = []
+        
+        if not tokens or not isinstance(tokens, list):
+            logger.error(f"❌ [TOKEN_SEARCH] No tokens found in market data!")
+            logger.error(f"   [TOKEN_SEARCH] Market data keys: {list(market_data.keys())[:20]}")
+            logger.error(f"   [TOKEN_SEARCH] tokens value: {tokens} (type: {type(tokens).__name__})")
+            logger.error(f"   [TOKEN_SEARCH] outcomes value: {outcomes} (type: {type(outcomes).__name__})")
+            return None
+        
+        outcome_upper = str(outcome).upper()
+        logger.warning(f"🔍 [TOKEN_SEARCH] Searching token_id for outcome='{outcome}' (upper: '{outcome_upper}')")
+        logger.warning(f"   [TOKEN_SEARCH] Available outcomes: {outcomes} (type: {type(outcomes).__name__})")
+        logger.warning(f"   [TOKEN_SEARCH] Tokens found: {len(tokens) if isinstance(tokens, list) else 0} tokens (type: {type(tokens).__name__})")
+        if isinstance(tokens, list) and len(tokens) > 0:
+            logger.warning(f"   [TOKEN_SEARCH] First token sample: {str(tokens[0])[:200]}")
+        else:
+            logger.error(f"   [TOKEN_SEARCH] ⚠️ NO TOKENS IN LIST! tokens={tokens}")
+        
+        # Если outcome - индекс
+        if outcome_upper.isdigit():
+            idx = int(outcome_upper)
+            if 0 <= idx < len(tokens):
+                token = tokens[idx]
+                if isinstance(token, dict):
+                    token_id = token.get("token_id") or token.get("tokenId") or token.get("id")
+                    if token_id:
+                        logger.debug(f"Found token_id by index {idx}: {token_id}")
+                        return token_id
+                elif isinstance(token, str):
+                    logger.debug(f"Found token_id by index {idx}: {token}")
+                    return token
+        
+        # Если outcome - название (YES, NO, Home, Away, Over, Under, или название команды)
+        # Сначала проверяем, если outcomes - это массив строк (названия), а tokens - объекты с token_id
+        if outcomes and isinstance(outcomes, list) and len(outcomes) > 0:
+            logger.warning(f"   [TOKEN_SEARCH] Checking outcomes list (length: {len(outcomes)})")
+            for i, outcome_name in enumerate(outcomes):
+                if isinstance(outcome_name, str):
+                    outcome_name_upper = outcome_name.upper()
+                    # Проверяем совпадение названия outcome
+                    match = outcome_upper == outcome_name_upper or outcome_upper in outcome_name_upper or outcome_name_upper in outcome_upper
+                    logger.warning(f"   [TOKEN_SEARCH] Outcome[{i}]: '{outcome_name}' (upper: '{outcome_name_upper}') - Match: {match}")
+                    if match:
+                        # Находим соответствующий token по индексу
+                        if i < len(tokens):
+                            token = tokens[i]
+                            logger.warning(f"   [TOKEN_SEARCH] Token[{i}]: type={type(token).__name__}, value={str(token)[:200]}")
+                            if isinstance(token, dict):
+                                token_id = token.get("token_id") or token.get("tokenId") or token.get("id")
+                                if token_id:
+                                    logger.warning(f"✅ [TOKEN_SEARCH] Found token_id by outcome name match (index {i}, outcome '{outcome_name}'): {token_id}")
+                                    return token_id
+                                else:
+                                    logger.error(f"⚠️ [TOKEN_SEARCH] Token at index {i} found but no token_id field. Keys: {list(token.keys())[:10]}")
+                                    logger.error(f"   [TOKEN_SEARCH] Full token: {token}")
+                            elif isinstance(token, str):
+                                logger.warning(f"✅ [TOKEN_SEARCH] Found token_id by outcome name match (index {i}, outcome '{outcome_name}'): {token}")
+                                return token
+                        else:
+                            logger.error(f"⚠️ [TOKEN_SEARCH] Outcome '{outcome_name}' found at index {i}, but tokens list has only {len(tokens)} elements")
+        
+        # Проверяем tokens напрямую
+        logger.info(f"   Checking tokens directly (count: {len(tokens)})")
+        for idx, token in enumerate(tokens):
+            if isinstance(token, dict):
+                token_outcome = token.get("outcome") or token.get("name") or token.get("label")
+                if token_outcome:
+                    token_outcome_upper = str(token_outcome).upper()
+                    match = outcome_upper == token_outcome_upper or outcome_upper in token_outcome_upper or token_outcome_upper in outcome_upper
+                    logger.info(f"   Token[{idx}]: outcome='{token_outcome}' (upper: '{token_outcome_upper}') - Match: {match}")
+                    if match:
+                        token_id = token.get("token_id") or token.get("tokenId") or token.get("id")
+                        if token_id:
+                            logger.info(f"✅ Found token_id by direct token match: {token_id}")
+                            return token_id
+                        else:
+                            logger.warning(f"⚠️ Token match found but no token_id field. Keys: {token.keys()}")
+            elif isinstance(token, str):
+                # Если token - строка (название outcome)
+                token_upper = token.upper()
+                match = outcome_upper == token_upper or outcome_upper in token_upper or token_upper in outcome_upper
+                logger.info(f"   Token[{idx}] (string): '{token}' (upper: '{token_upper}') - Match: {match}")
+                if match:
+                    # Если token - это строка, нужно найти соответствующий token_id
+                    # Проверяем, есть ли в market_data структура с token_id
+                    # Пытаемся найти token_id по индексу в другой структуре
+                    tokens_dict = market_data.get("tokens") or market_data.get("outcomeTokens")
+                    if tokens_dict and isinstance(tokens_dict, list) and idx < len(tokens_dict):
+                        token_obj = tokens_dict[idx]
+                        if isinstance(token_obj, dict):
+                            token_id = token_obj.get("token_id") or token_obj.get("tokenId") or token_obj.get("id")
+                            if token_id:
+                                logger.info(f"✅ Found token_id by string token match: {token_id}")
+                                return token_id
+        
+        # Если не нашли, возвращаем первый токен (fallback)
+        logger.error(f"❌ [TOKEN_SEARCH] Token ID not found for outcome '{outcome}' after all checks")
+        logger.error(f"   [TOKEN_SEARCH] Market data keys: {list(market_data.keys())[:20]}")
+        logger.error(f"   [TOKEN_SEARCH] Outcomes: {outcomes}")
+        logger.error(f"   [TOKEN_SEARCH] Tokens type: {type(tokens).__name__}, count: {len(tokens) if isinstance(tokens, list) else 'N/A'}")
+        if isinstance(tokens, list):
+            logger.error(f"   [TOKEN_SEARCH] All tokens: {[str(t)[:100] for t in tokens[:5]]}")
+        
+        if tokens:
+            first_token = tokens[0]
+            logger.warning(f"   [TOKEN_SEARCH] Using first token as fallback: {str(first_token)[:200]}")
+            if isinstance(first_token, dict):
+                token_id = first_token.get("token_id") or first_token.get("tokenId") or first_token.get("id")
+                if token_id:
+                    logger.warning(f"   [TOKEN_SEARCH] Fallback token_id: {token_id}")
+                    return token_id
+                else:
+                    logger.error(f"   [TOKEN_SEARCH] First token has no token_id! Keys: {list(first_token.keys())[:10]}")
+            elif isinstance(first_token, str):
+                logger.warning(f"   [TOKEN_SEARCH] Fallback token (string): {first_token}")
+                return first_token
+        
+        logger.error(f"❌ [TOKEN_SEARCH] Token ID not found for outcome '{outcome}'. No fallback available.")
+        return None

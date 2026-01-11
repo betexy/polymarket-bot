@@ -1,0 +1,44 @@
+========================================
+КОМАНДЫ ДЛЯ ЗАПУСКА БОТА
+========================================
+
+1. Установка зависимостей (если еще не установлены):
+   cd /root/polymarket_bot
+   pip3 install -r requirements.txt
+
+2. Настройка .env файла:
+   cp .env.example .env
+   # Отредактируйте .env и укажите:
+   # - API_SECRET_KEY (ваш секретный ключ)
+   # - POLYMARKET_PRIVATE_KEY (если планируете размещать ордера)
+   # - и другие настройки
+
+3. Запуск бота:
+   python3 -m app.main
+   
+   Или через скрипт:
+   ./START_BOT.sh
+
+4. Проверка работы:
+   # В другом терминале:
+   curl http://localhost:8000/bets/health
+   
+   # Или отправьте тестовую ставку:
+   curl -X POST http://localhost:8000/bets/ \
+     -H "Content-Type: application/json" \
+     -H "X-Secret-Key: YOUR_SECRET_KEY" \
+     -d '{
+       "bookmaker": "POLYMARKET",
+       "market": "ONE_TWO",
+       "target": "ONE",
+       "homeTeam": "Team 1",
+       "awayTeam": "Team 2",
+       "sport": "FOOTBALL",
+       "coef": "2.50",
+       "mode": "LIVE",
+       "timeValue": "FULL_TIME"
+     }'
+
+ТЕКУЩИЕ НАСТРОЙКИ:
+- Размер ставки: 2.0 USD
+- Порт API: 8000
