@@ -170,7 +170,25 @@ class PolymarketCLOBClient:
             )
             
             # Используем create_and_post_order для создания и отправки ордера за один раз
-            response = self._client.create_and_post_order(order_args)
+            try:
+                response = self._client.create_and_post_order(order_args)
+            except Exception as e:
+                error_msg = str(e)
+                # Если ошибка 401 (Unauthorized), пытаемся создать новые ключи
+                if "401" in error_msg or "Unauthorized" in error_msg or "Invalid api key" in error_msg:
+                    logger.warning(f"API key authentication failed: {e}. Attempting to create new API credentials...")
+                    try:
+                        # Создаем новые API ключи
+                        new_api_creds = self._client.create_or_derive_api_creds()
+                        self._client.set_api_creds(new_api_creds)
+                        logger.info("New API credentials created and set. Retrying order...")
+                        # Повторная попытка
+                        response = self._client.create_and_post_order(order_args)
+                    except Exception as e2:
+                        logger.error(f"Failed to create new API credentials: {e2}")
+                        raise e  # Пробрасываем оригинальную ошибку
+                else:
+                    raise  # Пробрасываем другие ошибки
             
             # response может быть dict или другой тип
             if isinstance(response, dict):
