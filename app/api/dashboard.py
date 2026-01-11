@@ -199,6 +199,11 @@ async def dashboard_page():
             <!-- Статистика будет загружена здесь -->
         </div>
         
+        <div class="chart-container" style="background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 30px;">
+            <h2 style="margin-bottom: 15px; color: #333; font-size: 18px;">График профита</h2>
+            <canvas id="profitChart" style="max-height: 300px;"></canvas>
+        </div>
+        
         <div class="tabs">
             <button class="tab active" onclick="showTab('bets')">Ставки</button>
             <button class="tab" onclick="showTab('logs')">Логи API</button>
@@ -315,6 +320,7 @@ async def dashboard_page():
         </div>
     </div>
     
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <script>
         function showTab(tabName) {
             // Скрываем все табы
@@ -348,6 +354,17 @@ async def dashboard_page():
                 const bets = await betsResponse.json();
                 displayBets(bets);
                 
+                // Загружаем данные для графика профита
+                try {
+                    const profitResponse = await fetch('/dashboard/api/profit-data?days=30&_=' + Date.now());
+                    if (profitResponse.ok) {
+                        const profitData = await profitResponse.json();
+                        updateProfitChart(profitData);
+                    }
+                } catch (error) {
+                    console.error('Error loading profit data:', error);
+                }
+                
                 // Загружаем логи
                 const logsResponse = await fetch('/dashboard/api/logs-history?_=' + Date.now());
                 if (!logsResponse.ok) throw new Error('Logs API error: ' + logsResponse.status);
@@ -370,6 +387,10 @@ async def dashboard_page():
         
         function displayStats(stats) {
             const statsDiv = document.getElementById('stats');
+            const totalProfit = stats.total_profit || 0.0;
+            const profitClass = totalProfit >= 0 ? 'success' : 'error';
+            const profitSign = totalProfit >= 0 ? '+' : '';
+            
             statsDiv.innerHTML = `
                 <div class="stat-card">
                     <h3>Всего ставок</h3>
@@ -378,6 +399,10 @@ async def dashboard_page():
                 <div class="stat-card success">
                     <h3>Размещено на Polymarket</h3>
                     <div class="value">${stats.successful_orders}</div>
+                </div>
+                <div class="stat-card ${profitClass}">
+                    <h3>Общий профит</h3>
+                    <div class="value">${profitSign}${totalProfit.toFixed(2)} USD</div>
                 </div>
                 <div class="stat-card" style="background: #fef3c7;">
                     <h3>Пропущено</h3>
@@ -408,6 +433,26 @@ async def dashboard_page():
                 const statusClass = status === 'success' ? 'success' : status === 'error' ? 'error' : 'skipped';
                 const statusText = status === 'success' ? 'Успешно' : status === 'error' ? 'Ошибка' : 'Пропущено';
                 
+                // Получаем информацию о результате
+                const profit = result.profit;
+                const resultStatus = result.result_status || (result.profit !== null && result.profit !== undefined ? (result.profit >= 0 ? 'win' : 'loss') : 'pending');
+                let resultText = '-';
+                let resultClass = '';
+                
+                if (resultStatus === 'win') {
+                    resultText = `✅ Выигрыш: +${profit ? profit.toFixed(2) : '0.00'} USD`;
+                    resultClass = 'success';
+                } else if (resultStatus === 'loss') {
+                    resultText = `❌ Проигрыш: ${profit ? profit.toFixed(2) : '0.00'} USD`;
+                    resultClass = 'error';
+                } else if (resultStatus === 'closed') {
+                    resultText = '⏸ Закрыт';
+                    resultClass = 'skipped';
+                } else if (status === 'success') {
+                    resultText = '⏳ В ожидании';
+                    resultClass = '';
+                }
+                
                 return `
                     <tr>
                         <td class="timestamp">${formatDateTime(bet.timestamp)}</td>
@@ -417,7 +462,7 @@ async def dashboard_page():
                         <td>${betData.surebet_profit ? betData.surebet_profit.toFixed(2) + '%' : '-'}</td>
                         <td>${betData.second_bookmaker || '-'}</td>
                         <td><span class="status ${statusClass}">${statusText}</span></td>
-                        <td class="json-data">${JSON.stringify(result, null, 2).substring(0, 200)}${JSON.stringify(result).length > 200 ? '...' : ''}</td>
+                        <td><span class="status ${resultClass}">${resultText}</span></td>
                     </tr>
                 `;
             }).join('');
@@ -544,6 +589,12 @@ async def get_bets_history(limit: int = 100):
 async def get_logs_history(limit: int = 100):
     """API для получения истории логов"""
     return log_storage.get_recent_logs(limit)
+
+
+@router.get("/api/profit-data")
+async def get_profit_data(days: int = 30):
+    """API для получения данных профита для графика"""
+    return log_storage.get_profit_data(days)
 
 
 @router.get("/api/settings")

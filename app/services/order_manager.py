@@ -294,12 +294,20 @@ class OrderManager:
                         self._bets_per_match[event_id] = self._bets_per_match.get(event_id, 0) + 1
                         logger.info(f"Event {event_id} bets count: {self._bets_per_match[event_id]}")
                     
+                    # Сохраняем информацию для расчета профита
+                    order_price = order_params.get("price", 0)
+                    order_size = order_params.get("size", 0)
+                    
                     result = {
                         "status": "success",
                         "order_id": order_id,
                         "market_id": market_id,
                         "token_id": token_id,
-                        "order_result": order_result
+                        "order_price": order_price,  # Цена покупки
+                        "order_size": order_size,    # Размер ставки
+                        "order_result": order_result,
+                        "profit": None,  # Будет рассчитан позже
+                        "result_status": "pending"  # pending, win, loss, closed
                     }
                     # Сохраняем в хранилище
                     log_storage.add_bet(bet_data.dict(), result)
