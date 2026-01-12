@@ -85,12 +85,29 @@ class PolymarketCLOBClient:
     def _initialize_client(self) -> None:
         """Инициализация CLOB клиента"""
         try:
-            # Создаем клиент с приватным ключом
-            self._client = ClobClient(
-                host=self.settings.polymarket_clob_host,
-                chain_id=self.settings.polymarket_chain_id,
-                key=self.settings.polymarket_private_key
-            )
+            # Параметры для инициализации
+            client_kwargs = {
+                "host": self.settings.polymarket_clob_host,
+                "chain_id": self.settings.polymarket_chain_id,
+                "key": self.settings.polymarket_private_key
+            }
+            
+            # Добавляем signature_type (1 = Magic Link/Email, 2 = MetaMask)
+            if hasattr(self.settings, 'polymarket_signature_type') and self.settings.polymarket_signature_type:
+                client_kwargs["signature_type"] = self.settings.polymarket_signature_type
+            else:
+                client_kwargs["signature_type"] = 1  # По умолчанию Magic Link/Email
+            
+            # Добавляем funder (Proxy адрес) - КРИТИЧЕСКИ ВАЖНО!
+            if hasattr(self.settings, 'polymarket_proxy_address') and self.settings.polymarket_proxy_address:
+                client_kwargs["funder"] = self.settings.polymarket_proxy_address
+                logger.info(f"Using Proxy Wallet (funder): {self.settings.polymarket_proxy_address}")
+            else:
+                logger.warning("⚠️ POLYMARKET_PROXY_ADDRESS not set! Trading will use EOA address (may fail if balance is on Proxy)")
+                logger.warning("   Set POLYMARKET_PROXY_ADDRESS in .env file (find it in Polymarket UI -> Profile -> Copy Address)")
+            
+            # Создаем клиент с приватным ключом и настройками
+            self._client = ClobClient(**client_kwargs)
             
             # Если есть API ключи, используем их
             if (self.settings.polymarket_api_key and 
@@ -186,6 +203,18 @@ class PolymarketCLOBClient:
                         response = self._client.create_and_post_order(order_args)
                     except Exception as e2:
                         logger.error(f"Failed to create new API credentials: {e2}")
+                        raise e  # Пробрасываем оригинальную ошибку
+                # Если ошибка "not enough balance / allowance", пытаемся обновить allowance
+                elif "not enough balance" in error_msg.lower() or "not enough allowance" in error_msg.lower() or "allowance" in error_msg.lower():
+                    logger.warning(f"Insufficient balance/allowance: {e}. Attempting to update allowance...")
+                    try:
+                        # Обновляем allowance
+                        self.update_balance_allowance()
+                        logger.info("Allowance updated. Retrying order...")
+                        # Повторная попытка
+                        response = self._client.create_and_post_order(order_args)
+                    except Exception as e2:
+                        logger.error(f"Failed to update allowance or retry order: {e2}")
                         raise e  # Пробрасываем оригинальную ошибку
                 else:
                     raise  # Пробрасываем другие ошибки
@@ -299,10 +328,150 @@ class PolymarketCLOBClient:
             raise Exception("CLOB client is not available or not initialized")
         
         try:
-            return self._client.get_balance()
+            # Используем get_balance_allowance для получения баланса
+            balance_allowance = self._client.get_balance_allowance()
+            if isinstance(balance_allowance, dict):
+                return balance_allowance
+            else:
+                # Если возвращается не dict, оборачиваем
+                return {"balance": balance_allowance}
         except Exception as e:
             logger.error(f"Error getting balance: {e}", exc_info=True)
             raise
+    
+    def get_address(self) -> Optional[str]:
+        """
+        Получение адреса кошелька
+        
+        Returns:
+            Адрес кошелька или None
+        """
+        if not self.is_available():
+            return None
+        
+        try:
+            return self._client.get_address()
+        except Exception as e:
+            logger.error(f"Error getting address: {e}", exc_info=True)
+            return None
+    
+    def get_balance_allowance(self) -> Dict[str, Any]:
+        """
+        Получение баланса и allowance
+        
+        Returns:
+            Словарь с балансом и allowance
+        """
+        if not self.is_available():
+            raise Exception("CLOB client is not available or not initialized")
+        
+        try:
+            return self._client.get_balance_allowance()
+        except Exception as e:
+            logger.error(f"Error getting balance/allowance: {e}", exc_info=True)
+            raise
+    
+    def update_balance_allowance(self, amount: Optional[float] = None) -> Dict[str, Any]:
+        """
+        Обновление allowance для CLOB контракта
+        
+        Args:
+            amount: Сумма для allowance (если None, устанавливается максимальное значение)
+        
+        Returns:
+            Результат обновления
+        """
+        if not self.is_available():
+            raise Exception("CLOB client is not available or not initialized")
+        
+        try:
+            if amount is not None:
+                return self._client.update_balance_allowance(amount=amount)
+            else:
+                # Устанавливаем максимальное allowance
+                return self._client.update_balance_allowance()
+        except Exception as e:
+            logger.error(f"Error updating balance allowance: {e}", exc_info=True)
+            raise
+    
+    def check_balance_and_allowance(self, required_amount: float) -> Dict[str, Any]:
+        """
+        Проверка баланса и allowance перед размещением ордера
+        
+        Args:
+            required_amount: Требуемая сумма для ордера
+        
+        Returns:
+            Словарь с результатами проверки:
+            {
+                "has_balance": bool,
+                "has_allowance": bool,
+                "balance": float,
+                "allowance": float,
+                "address": str,
+                "needs_allowance_update": bool
+            }
+        """
+        if not self.is_available():
+            return {
+                "has_balance": False,
+                "has_allowance": False,
+                "error": "CLOB client not available"
+            }
+        
+        try:
+            # Получаем адрес кошелька
+            address = self.get_address()
+            
+            # Пытаемся получить баланс и allowance
+            # Если метод требует параметры, пропускаем проверку и полагаемся на автоматическое обновление при ошибке
+            balance = None
+            allowance = None
+            needs_allowance_update = True  # По умолчанию предполагаем, что нужно обновить
+            
+            try:
+                balance_allowance_info = self._client.get_balance_allowance()
+                
+                if isinstance(balance_allowance_info, dict):
+                    # Пытаемся извлечь баланс из разных возможных полей
+                    balance = float(balance_allowance_info.get("balance", 
+                        balance_allowance_info.get("available", 
+                        balance_allowance_info.get("usdc", 
+                        balance_allowance_info.get("usdcBalance", 0)))))
+                    
+                    # Пытаемся извлечь allowance
+                    allowance = float(balance_allowance_info.get("allowance",
+                        balance_allowance_info.get("usdc_allowance",
+                        balance_allowance_info.get("usdcAllowance", 0))))
+                    
+                    needs_allowance_update = allowance < required_amount if allowance is not None else True
+                elif isinstance(balance_allowance_info, (int, float)):
+                    balance = float(balance_allowance_info)
+            except Exception as e:
+                logger.warning(f"Could not get balance/allowance directly: {e}. Will rely on automatic allowance update on error.")
+                # Продолжаем без проверки, полагаясь на автоматическое обновление при ошибке
+            
+            result = {
+                "has_balance": balance >= required_amount if balance is not None else None,
+                "has_allowance": allowance >= required_amount if allowance is not None else None,
+                "balance": balance,
+                "allowance": allowance,
+                "address": address,
+                "needs_allowance_update": needs_allowance_update,
+                "required_amount": required_amount
+            }
+            
+            logger.info(f"Balance check: balance={balance}, allowance={allowance}, required={required_amount}, address={address}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error checking balance and allowance: {e}", exc_info=True)
+            return {
+                "has_balance": None,
+                "has_allowance": None,
+                "error": str(e)
+            }
     
     def get_token_id_from_market(
         self,

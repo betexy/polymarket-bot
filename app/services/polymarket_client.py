@@ -388,6 +388,10 @@ class PolymarketClient:
             # Определяем тип market по тексту
             detected_type = self._detect_market_type(market_text)
             
+            # Логируем для отладки, если тип не совпадает
+            if market_type == "ONE_TWO" and detected_type != market_type:
+                logger.debug(f"Market ID {market.get('id')}: detected_type={detected_type}, expected={market_type}, question='{market.get('question', '')[:60]}'")
+            
             if detected_type != market_type:
                 continue
             
@@ -397,7 +401,8 @@ class PolymarketClient:
                     "id": market.get("id"),
                     "title": market.get("title", ""),
                     "question": market.get("question", ""),
-                    "market_text": market_text
+                    "market_text": market_text,
+                    "market": market  # Сохраняем весь объект для детального логирования
                 })
             
             # Для отладки TOTAL маркетов
@@ -422,7 +427,15 @@ class PolymarketClient:
         
         # Если не нашли и это ONE_TWO, логируем для отладки
         if market_type == "ONE_TWO" and one_two_markets and target:
-            logger.debug(f"ONE_TWO markets found but target '{target}' didn't match. Markets: {[m['title'][:50] for m in one_two_markets[:5]]}")
+            logger.warning(f"ONE_TWO markets found ({len(one_two_markets)}) but target '{target}' didn't match")
+            # Детальное логирование для каждого маркета
+            for m in one_two_markets[:3]:
+                market_obj = m.get('market', {})
+                market_text_for_check = f"{m.get('title', '')} {m.get('question', '')}".lower()
+                match_result = self._check_target_match(market_text_for_check, target, market_type, home_teams, away_teams)
+                logger.warning(f"  Market ID {m.get('id')}: title='{m.get('title', 'N/A')[:60]}', question='{m.get('question', 'N/A')[:60]}', target_match={match_result}")
+                logger.warning(f"    Market text (lower): '{market_text_for_check[:150]}'")
+                logger.warning(f"    Home teams: {home_teams}, Away teams: {away_teams}")
         
         # Если не нашли и это TOTAL, логируем для отладки
         if market_type in ["TOTAL", "T1_TOTAL", "T2_TOTAL"] and total_markets:
@@ -432,11 +445,20 @@ class PolymarketClient:
     
     def _detect_market_type(self, market_text: str) -> Optional[str]:
         """Определение типа market по тексту"""
-        market_text = market_text.upper()
+        market_text_upper = market_text.upper()
+        market_text = market_text_upper
         
         # 1X2 (Match Winner / Match Result)
         if any(word in market_text for word in ["WINNER", "WIN", "RESULT", "1X2", "MATCH RESULT", "MONEYLINE"]):
             return "ONE_TWO"
+        
+        # Если формат "Team A vs. Team B" или "Team A vs Team B" без других ключевых слов
+        # и это не TOTAL/HDP (нет OVER/UNDER/SPREAD/HANDICAP), то это скорее всего ONE_TWO
+        if " VS. " in market_text or " VS " in market_text:
+            # Проверяем, что это не TOTAL или HDP
+            if not any(word in market_text for word in ["TOTAL", "OVER", "UNDER", "O/U", "SPREAD", "HANDICAP", "HDP", "POINTS", "SCORE"]):
+                # Если это формат "Team A vs. Team B", то это скорее всего ONE_TWO (Match Winner)
+                return "ONE_TWO"
         
         # TOTAL (Over/Under)
         # Проверяем различные варианты написания Total/Over/Under

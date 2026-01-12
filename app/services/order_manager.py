@@ -52,14 +52,9 @@ class OrderManager:
             if bet_data.second_bookmaker:
                 allowed_bookmakers = self.settings.allowed_second_bookmakers
                 if bet_data.second_bookmaker not in allowed_bookmakers:
-                    logger.info(f"Bet skipped: second_bookmaker {bet_data.second_bookmaker} not in allowed list {allowed_bookmakers}")
+                    # Пропускаем без логирования (чтобы не засорять логи)
                     result = {"status": "skipped", "reason": f"second_bookmaker_not_allowed: {bet_data.second_bookmaker}"}
                     log_storage.add_bet(bet_data.dict(), result)
-                    log_storage.add_api_log(
-                        f"Bet skipped: second_bookmaker {bet_data.second_bookmaker} not allowed",
-                        "INFO",
-                        {"second_bookmaker": bet_data.second_bookmaker, "allowed": allowed_bookmakers}
-                    )
                     return result
             
             # Логируем, что ставка прошла проверку и будет обрабатываться
@@ -91,8 +86,9 @@ class OrderManager:
             
             market_info = await self._find_market(bet_data, order_data)
             if not market_info:
-                logger.warning(f"Market not found for: {order_data['search_query']}")
-                result = {"status": "error", "reason": "market_not_found", "search_query": order_data.get('search_query')}
+                search_query = order_data.get('search_query', 'N/A')
+                logger.warning(f"Market not found for: {search_query}")
+                result = {"status": "error", "reason": "market_not_found", "search_query": search_query}
                 log_storage.add_bet(bet_data.dict(), result)
                 log_storage.add_api_log(
                     f"Market not found: {bet_data.homeTeam} vs {bet_data.awayTeam}",
@@ -164,8 +160,27 @@ class OrderManager:
                 logger.error("Market ID not found in market_info")
                 return {"status": "error", "reason": "invalid_market_info"}
             
-            # Рассчет параметров ордера
-            order_params = self._calculate_order_params(bet_data, order_data, market_info)
+            # Рассчет параметров ордера (с проверкой текущей цены)
+            try:
+                order_params = self._calculate_order_params(bet_data, order_data, market_info)
+            except ValueError as e:
+                error_msg = str(e)
+                if "profit_too_low" in error_msg:
+                    logger.warning(f"Bet skipped: {error_msg}")
+                    result = {"status": "skipped", "reason": error_msg}
+                    log_storage.add_bet(bet_data.dict(), result)
+                    log_storage.add_api_log(
+                        f"Bet skipped: {error_msg}",
+                        "WARNING",
+                        {
+                            "market_id": market_info.get('id'),
+                            "original_profit": bet_data.surebet_profit,
+                            "reason": error_msg
+                        }
+                    )
+                    return result
+                else:
+                    raise
             
             # Получение token_id из market данных
             outcome = order_params.get("outcome", "YES")
@@ -259,6 +274,63 @@ class OrderManager:
             
             # Размещение ордера через CLOB API
             if self.clob_client and self.clob_client.is_available():
+                # Проверяем баланс и allowance перед размещением ордера
+                required_amount = float(order_params["size"]) * float(order_params["price"])
+                balance_check = self.clob_client.check_balance_and_allowance(required_amount)
+                
+                # Логируем информацию о балансе
+                logger.info(f"Balance check: balance={balance_check.get('balance', 0)}, allowance={balance_check.get('allowance', 'unknown')}, required={required_amount}, address={balance_check.get('address', 'unknown')}")
+                log_storage.add_api_log(
+                    f"Balance check before order: balance={balance_check.get('balance', 0)}, required={required_amount}",
+                    "INFO",
+                    {
+                        "address": balance_check.get("address"),
+                        "balance": balance_check.get("balance"),
+                        "allowance": balance_check.get("allowance"),
+                        "required_amount": required_amount,
+                        "has_balance": balance_check.get("has_balance"),
+                        "has_allowance": balance_check.get("has_allowance")
+                    }
+                )
+                
+                # Проверяем баланс (если проверка прошла успешно)
+                if balance_check.get("has_balance") is False:
+                    error_msg = f"Insufficient balance: {balance_check.get('balance', 0)} < {required_amount}"
+                    logger.error(error_msg)
+                    result = {
+                        "status": "error",
+                        "reason": "insufficient_balance",
+                        "balance": balance_check.get("balance", 0),
+                        "required": required_amount,
+                        "address": balance_check.get("address")
+                    }
+                    log_storage.add_bet(bet_data.dict(), result)
+                    log_storage.add_api_log(
+                        f"Order skipped: insufficient balance",
+                        "ERROR",
+                        {
+                            "balance": balance_check.get("balance", 0),
+                            "required": required_amount,
+                            "address": balance_check.get("address")
+                        }
+                    )
+                    return result
+                
+                # Проверяем и обновляем allowance, если нужно
+                if balance_check.get("needs_allowance_update", True):
+                    logger.info("Updating balance allowance for CLOB contract...")
+                    try:
+                        self.clob_client.update_balance_allowance()
+                        logger.info("Balance allowance updated successfully")
+                        log_storage.add_api_log(
+                            "Balance allowance updated",
+                            "INFO",
+                            {"address": balance_check.get("address")}
+                        )
+                    except Exception as allowance_error:
+                        logger.warning(f"Failed to update allowance (may not be critical): {allowance_error}")
+                        # Продолжаем попытку размещения ордера, т.к. ошибка может быть не критичной
+                
                 # Логируем отправку в CLOB API
                 logger.info(f"Sending order to CLOB API: market_id={market_id}, price={order_params['price']}, size={order_params['size']}")
                 log_storage.add_api_log(
@@ -406,24 +478,50 @@ class OrderManager:
             events = []
             existing_ids = set()
             
+            # Сначала пробуем поиск по полному запросу (более точный)
+            if search_query:
+                logger.info(f"Trying full search query first: '{search_query}'")
+                events_query = await self.client.search_events(search_query, limit=30, max_pages=2)
+                if events_query:
+                    new_events = [e for e in events_query if e.get('id') not in existing_ids]
+                    for e in new_events:
+                        existing_ids.add(e.get('id'))
+                    events.extend(new_events)
+                    logger.info(f"Found {len(new_events)} events searching by full query: '{search_query}'")
+            
+            # Затем ищем по каждой команде отдельно (для случаев, когда полный запрос не сработал)
             for team in all_teams:
-                if team:
-                    team_events = await self.client.search_events(team, limit=20, max_pages=1)
+                if team and len(team) > 2:  # Пропускаем слишком короткие строки
+                    logger.info(f"Searching by team: '{team}'")
+                    team_events = await self.client.search_events(team, limit=30, max_pages=2)
                     if team_events:
                         # Добавляем только новые события (избегаем дубликатов)
                         new_events = [e for e in team_events if e.get('id') not in existing_ids]
                         for e in new_events:
                             existing_ids.add(e.get('id'))
                         events.extend(new_events)
-                        logger.info(f"Found {len(new_events)} events searching by team: {team}")
+                        logger.info(f"Found {len(new_events)} events searching by team: '{team}' (total unique: {len(events)})")
             
-            # Если все еще пусто, пробуем по полному запросу
-            if not events and search_query:
-                events_query = await self.client.search_events(search_query, limit=20, max_pages=1)
-                if events_query:
-                    new_events = [e for e in events_query if e.get('id') not in existing_ids]
-                    events.extend(new_events)
-                    logger.info(f"Found {len(new_events)} events searching by full query: {search_query}")
+            # Если все еще пусто, пробуем поиск по отдельным словам из команд
+            if not events and all_teams:
+                logger.info("No events found, trying search by individual words from team names...")
+                for team in all_teams:
+                    if team:
+                        # Разбиваем команду на слова и ищем по каждому значимому слову
+                        words = [w.strip() for w in team.split() if len(w.strip()) > 3]  # Только слова длиннее 3 символов
+                        for word in words[:3]:  # Максимум 3 слова на команду
+                            logger.info(f"Trying search by word: '{word}'")
+                            word_events = await self.client.search_events(word, limit=20, max_pages=1)
+                            if word_events:
+                                new_events = [e for e in word_events if e.get('id') not in existing_ids]
+                                for e in new_events:
+                                    existing_ids.add(e.get('id'))
+                                events.extend(new_events)
+                                logger.info(f"Found {len(new_events)} events searching by word: '{word}'")
+                                if len(events) >= 10:  # Если нашли достаточно, прекращаем поиск
+                                    break
+                        if len(events) >= 10:
+                            break
             
             if not events:
                 logger.warning(f"No events found for teams: {all_teams}")
@@ -439,12 +537,16 @@ class OrderManager:
             # 2. Фильтруем события по всем командам (независимо от порядка)
             # Это важно, т.к. команды могут быть поменяны местами в Polymarket
             matching_event = None
-            teams_lower = [t.lower() for t in all_teams if t]
+            teams_lower = [t.lower().strip() for t in all_teams if t and len(t.strip()) > 0]
             
+            logger.info(f"Filtering {len(events)} events by teams: {teams_lower}")
+            
+            # Сначала ищем точное совпадение всех команд
             for event in events:
-                title = (event.get('title', '') + ' ' + (event.get('description', '') or '')).lower()
+                title = (event.get('title', '') or '').lower()
+                description = (event.get('description', '') or '').lower()
                 slug = (event.get('slug', '') or '').lower()
-                event_text = f"{title} {slug}"
+                event_text = f"{title} {description} {slug}"
                 
                 # Проверяем, что все команды присутствуют в событии (независимо от порядка)
                 if len(teams_lower) > 0:
@@ -452,15 +554,41 @@ class OrderManager:
                     # Если найдены все команды - это наше событие
                     if teams_found == len(teams_lower):
                         matching_event = event
-                        logger.info(f"Found matching event (all {len(teams_lower)} teams present): {event.get('id')}")
+                        logger.info(f"✅ Found exact matching event (all {len(teams_lower)} teams present): {event.get('id')}, title: {event.get('title', '')[:60]}")
+                        break
+            
+            # Если точного совпадения нет, пробуем частичное (хотя бы 50% команд)
+            if not matching_event and len(teams_lower) > 1:
+                logger.info("No exact match found, trying partial match (at least 50% of teams)...")
+                min_teams_required = max(1, len(teams_lower) // 2)  # Хотя бы половина команд
+                
+                for event in events:
+                    title = (event.get('title', '') or '').lower()
+                    description = (event.get('description', '') or '').lower()
+                    slug = (event.get('slug', '') or '').lower()
+                    event_text = f"{title} {description} {slug}"
+                    
+                    teams_found = sum(1 for team in teams_lower if team in event_text)
+                    if teams_found >= min_teams_required:
+                        matching_event = event
+                        logger.info(f"✅ Found partial matching event ({teams_found}/{len(teams_lower)} teams): {event.get('id')}, title: {event.get('title', '')[:60]}")
                         break
             
             if not matching_event:
-                logger.warning(f"No matching event found for {home_team_raw} vs {away_team_raw}")
+                logger.warning(f"❌ No matching event found for {home_team_raw} vs {away_team_raw}")
+                logger.warning(f"   Searched {len(events)} events, teams: {all_teams}")
+                if events:
+                    logger.warning(f"   Sample event titles: {[e.get('title', 'N/A')[:50] for e in events[:5]]}")
                 log_storage.add_api_log(
                     f"Event search: no matching event for {home_team_raw} vs {away_team_raw}",
                     "WARNING",
-                    {"home_team": home_team_raw, "away_team": away_team_raw, "events_found": len(events)}
+                    {
+                        "home_team": home_team_raw, 
+                        "away_team": away_team_raw, 
+                        "extracted_teams": all_teams,
+                        "events_found": len(events),
+                        "sample_events": [{"id": e.get('id'), "title": e.get('title', '')[:60]} for e in events[:5]] if events else []
+                    }
                 )
                 return None
             
@@ -487,10 +615,18 @@ class OrderManager:
             
             logger.info(f"Found {len(markets)} markets for event {event_id}")
             
+            # Логируем примеры маркетов для отладки
+            if markets:
+                logger.info(f"Sample markets for event {event_id}:")
+                for m in markets[:3]:
+                    logger.info(f"  Market ID {m.get('id')}: title='{m.get('title', 'N/A')[:60]}', question='{m.get('question', 'N/A')[:60]}'")
+            
             # 4. Фильтруем markets по типу, target и pivot
             market_type = bet_data.market
             target = bet_data.target
             pivot = bet_data.pivot
+            
+            logger.info(f"Filtering markets: market_type={market_type}, target={target}, pivot={pivot}, home_teams={home_teams}, away_teams={away_teams}")
             
             matching_market = self.client._filter_markets_by_type(
                 markets=markets,
@@ -545,16 +681,21 @@ class OrderManager:
                 )
                 return matching_market
             else:
-                logger.warning(f"No matching market found for type={market_type}, target={target}, pivot={pivot}")
+                logger.warning(f"❌ No matching market found for type={market_type}, target={target}, pivot={pivot}")
+                logger.warning(f"   Event ID: {event_id}, Markets available: {len(markets)}")
+                if markets:
+                    logger.warning(f"   Sample market questions: {[m.get('question', m.get('title', 'N/A'))[:60] for m in markets[:5]]}")
                 log_storage.add_api_log(
                     f"Market search: no matching market",
                     "WARNING",
                     {
                         "event_id": event_id,
+                        "event_title": matching_event.get('title', '')[:60] if matching_event else None,
                         "market_type": market_type,
                         "target": target,
                         "pivot": pivot,
-                        "markets_count": len(markets)
+                        "markets_count": len(markets),
+                        "sample_markets": [{"id": m.get('id'), "question": m.get('question', m.get('title', ''))[:60]} for m in markets[:5]] if markets else []
                     }
                 )
                 return None
@@ -588,11 +729,46 @@ class OrderManager:
             except (ValueError, TypeError):
                 pass
         
-        # Цена из коэффициента
-        price = order_data["price"]
-        
         # Извлекаем outcome из market данных
         outcome = self.mapper.extract_market_outcome(market_info, bet_data)
+        
+        # Получаем текущую цену на Polymarket и сравниваем с ценой из парсера
+        current_price = self._get_current_price_from_market(market_info, outcome)
+        parser_price = order_data["price"]  # Цена из коэффициента парсера
+        
+        # Проверяем, не изменился ли коэффициент (цена) на Polymarket
+        if current_price is not None and parser_price is not None and bet_data.surebet_profit is not None:
+            # Вычисляем коэффициент второй БК из surebet_profit
+            # profit = (coef_second / coef_polymarket - 1) * 100
+            # coef_second = coef_polymarket * (profit/100 + 1)
+            parser_coef = 1.0 / parser_price if parser_price > 0 else 0
+            coef_second_bk = parser_coef * (bet_data.surebet_profit / 100.0 + 1.0)
+            
+            # Получаем текущий коэффициент на Polymarket
+            current_coef = 1.0 / current_price if current_price > 0 else 0
+            
+            # Пересчитываем profit с текущим коэффициентом
+            if current_coef > 0:
+                recalculated_profit = (coef_second_bk / current_coef - 1.0) * 100.0
+                
+                logger.info(f"Profit recalculation: parser_coef={parser_coef:.4f} (price={parser_price:.4f}), "
+                          f"current_coef={current_coef:.4f} (price={current_price:.4f}), "
+                          f"coef_second_bk={coef_second_bk:.4f}, "
+                          f"original_profit={bet_data.surebet_profit:.2f}%, "
+                          f"recalculated_profit={recalculated_profit:.2f}%")
+                
+                # Проверяем, что пересчитанный profit >= -0.5%
+                if recalculated_profit < -0.5:
+                    logger.warning(f"Recalculated profit {recalculated_profit:.2f}% < -0.5%, skipping bet")
+                    raise ValueError(f"profit_too_low: recalculated_profit={recalculated_profit:.2f}%")
+                else:
+                    logger.info(f"Recalculated profit {recalculated_profit:.2f}% >= -0.5%, placing bet with current price")
+            
+            # Используем текущую цену для размещения ордера
+            price = current_price
+        else:
+            # Если не удалось получить текущую цену или нет surebet_profit, используем цену из парсера
+            price = parser_price
         
         # TODO: Добавить логику коррекции цены с учетом spread, комиссий и т.д.
         # TODO: Для размещения ордеров нужен CLOB API, не Gamma API
@@ -602,3 +778,77 @@ class OrderManager:
             "price": price,
             "outcome": outcome
         }
+    
+    def _get_current_price_from_market(self, market_info: Dict[str, Any], outcome: Optional[str]) -> Optional[float]:
+        """
+        Получение текущей цены из market_info
+        
+        Args:
+            market_info: Данные маркета
+            outcome: Название outcome для которого нужно получить цену
+            
+        Returns:
+            Текущая цена (0.01-0.99) или None
+        """
+        try:
+            # Пытаемся получить outcomePrices
+            outcome_prices = market_info.get('outcomePrices', [])
+            outcomes = market_info.get('outcomes', [])
+            
+            # Если outcomePrices - строка JSON, парсим её
+            if isinstance(outcome_prices, str):
+                import json
+                try:
+                    outcome_prices = json.loads(outcome_prices)
+                except (json.JSONDecodeError, ValueError):
+                    logger.warning(f"Could not parse outcomePrices as JSON: {outcome_prices}")
+                    outcome_prices = []
+            
+            # Если outcomes - строка JSON, парсим её
+            if isinstance(outcomes, str):
+                import json
+                try:
+                    outcomes = json.loads(outcomes)
+                except (json.JSONDecodeError, ValueError):
+                    logger.warning(f"Could not parse outcomes as JSON: {outcomes}")
+                    outcomes = []
+            
+            # Ищем цену для нужного outcome
+            if outcome and outcomes and outcome_prices:
+                if len(outcomes) == len(outcome_prices):
+                    try:
+                        outcome_index = outcomes.index(outcome)
+                        price_str = outcome_prices[outcome_index]
+                        price = float(price_str)
+                        logger.debug(f"Found current price for outcome '{outcome}': {price}")
+                        return price
+                    except (ValueError, IndexError, TypeError) as e:
+                        logger.debug(f"Could not find price for outcome '{outcome}': {e}")
+            
+            # Если не нашли по outcome, берем первую доступную цену
+            if outcome_prices and len(outcome_prices) > 0:
+                try:
+                    price_str = outcome_prices[0]
+                    price = float(price_str)
+                    logger.debug(f"Using first available price: {price}")
+                    return price
+                except (ValueError, TypeError) as e:
+                    logger.debug(f"Could not parse price: {e}")
+            
+            # Пытаемся найти цену в других полях
+            price_fields = ['price', 'lastPrice', 'bestPrice', 'markPrice']
+            for field in price_fields:
+                if field in market_info:
+                    try:
+                        price = float(market_info[field])
+                        logger.debug(f"Found price in field '{field}': {price}")
+                        return price
+                    except (ValueError, TypeError):
+                        continue
+            
+            logger.debug("Could not find current price in market_info")
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Error getting current price from market: {e}")
+            return None

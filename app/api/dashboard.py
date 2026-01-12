@@ -64,9 +64,36 @@ async def dashboard_page():
             font-size: 32px;
             font-weight: bold;
             color: #333;
+            transition: all 0.3s ease;
         }
         .stat-card.success .value { color: #10b981; }
         .stat-card.error .value { color: #ef4444; }
+        .stat-card .value.updating {
+            opacity: 0.6;
+        }
+        tr {
+            transition: background-color 0.2s ease;
+        }
+        tr.new-row {
+            animation: fadeIn 0.5s ease;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-5px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .updating-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border: 2px solid #3b82f6;
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-left: 8px;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
         .tabs {
             display: flex;
             gap: 10px;
@@ -191,7 +218,7 @@ async def dashboard_page():
         <h1>🤖 Polymarket Bot Dashboard</h1>
         
         <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 20px;">
-            <button class="refresh-btn" onclick="loadData()">🔄 Обновить</button>
+            <button class="refresh-btn" onclick="loadData()" id="refresh-btn">🔄 Обновить</button>
             <span id="update-status" style="color: #6b7280; font-size: 14px;"></span>
         </div>
         
@@ -322,6 +349,17 @@ async def dashboard_page():
     
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <script>
+        // Кэш данных для сравнения
+        let cachedData = {
+            stats: null,
+            bets: [],
+            logs: [],
+            profitData: null
+        };
+        
+        // Флаг обновления для предотвращения одновременных запросов
+        let isUpdating = false;
+        
         function showTab(tabName) {
             // Скрываем все табы
             document.querySelectorAll('.tab-content').forEach(tab => {
@@ -336,97 +374,167 @@ async def dashboard_page():
             event.target.classList.add('active');
         }
         
-        async function loadData() {
+        async function loadData(showStatus = true) {
+            if (isUpdating) return;
+            isUpdating = true;
+            
             const statusEl = document.getElementById('update-status');
+            const refreshBtn = document.getElementById('refresh-btn');
+            
             try {
-                statusEl.textContent = 'Обновление...';
-                statusEl.style.color = '#3b82f6';
-                
-                // Загружаем статистику
-                const statsResponse = await fetch('/dashboard/api/stats?_=' + Date.now());
-                if (!statsResponse.ok) throw new Error('Stats API error: ' + statsResponse.status);
-                const stats = await statsResponse.json();
-                displayStats(stats);
-                
-                // Загружаем ставки
-                const betsResponse = await fetch('/dashboard/api/bets-history?_=' + Date.now());
-                if (!betsResponse.ok) throw new Error('Bets API error: ' + betsResponse.status);
-                const bets = await betsResponse.json();
-                displayBets(bets);
-                
-                // Загружаем данные для графика профита
-                try {
-                    const profitResponse = await fetch('/dashboard/api/profit-data?days=30&_=' + Date.now());
-                    if (profitResponse.ok) {
-                        const profitData = await profitResponse.json();
-                        updateProfitChart(profitData);
-                    }
-                } catch (error) {
-                    console.error('Error loading profit data:', error);
+                if (showStatus) {
+                    statusEl.innerHTML = '<span class="updating-indicator"></span> Обновление...';
+                    statusEl.style.color = '#3b82f6';
+                    refreshBtn.disabled = true;
+                    refreshBtn.style.opacity = '0.6';
                 }
                 
-                // Загружаем логи
-                const logsResponse = await fetch('/dashboard/api/logs-history?_=' + Date.now());
-                if (!logsResponse.ok) throw new Error('Logs API error: ' + logsResponse.status);
-                const logs = await logsResponse.json();
-                displayLogs(logs);
+                // Параллельная загрузка всех данных
+                const [statsResponse, betsResponse, logsResponse, profitResponse] = await Promise.all([
+                    fetch('/dashboard/api/stats?_=' + Date.now()),
+                    fetch('/dashboard/api/bets-history?_=' + Date.now()),
+                    fetch('/dashboard/api/logs-history?_=' + Date.now()),
+                    fetch('/dashboard/api/profit-data?days=30&_=' + Date.now())
+                ]);
                 
-                statusEl.textContent = 'Обновлено: ' + new Date().toLocaleTimeString('ru-RU');
-                statusEl.style.color = '#10b981';
-                setTimeout(() => {
-                    if (statusEl.textContent.includes('Обновлено:')) {
-                        statusEl.textContent = '';
+                // Обрабатываем статистику
+                if (statsResponse.ok) {
+                    const stats = await statsResponse.json();
+                    updateStats(stats);
+                    cachedData.stats = stats;
+                }
+                
+                // Обрабатываем ставки
+                if (betsResponse.ok) {
+                    const bets = await betsResponse.json();
+                    updateBets(bets);
+                    cachedData.bets = bets;
+                }
+                
+                // Обрабатываем логи
+                if (logsResponse.ok) {
+                    const logs = await logsResponse.json();
+                    updateLogs(logs);
+                    cachedData.logs = logs;
+                }
+                
+                // Обрабатываем график профита
+                if (profitResponse.ok) {
+                    const profitData = await profitResponse.json();
+                    // Обновляем график только если данные изменились
+                    if (JSON.stringify(profitData) !== JSON.stringify(cachedData.profitData)) {
+                        updateProfitChart(profitData);
+                        cachedData.profitData = profitData;
                     }
-                }, 3000);
+                }
+                
+                if (showStatus) {
+                    statusEl.textContent = 'Обновлено: ' + new Date().toLocaleTimeString('ru-RU', { timeZone: 'Asia/Jakarta' });
+                    statusEl.style.color = '#10b981';
+                    refreshBtn.disabled = false;
+                    refreshBtn.style.opacity = '1';
+                    setTimeout(() => {
+                        if (statusEl.textContent.includes('Обновлено:')) {
+                            statusEl.textContent = '';
+                        }
+                    }, 2000);
+                }
             } catch (error) {
                 console.error('Error loading data:', error);
-                statusEl.textContent = 'Ошибка: ' + error.message;
-                statusEl.style.color = '#ef4444';
+                if (showStatus) {
+                    statusEl.textContent = 'Ошибка: ' + error.message;
+                    statusEl.style.color = '#ef4444';
+                    refreshBtn.disabled = false;
+                    refreshBtn.style.opacity = '1';
+                }
+            } finally {
+                isUpdating = false;
             }
         }
         
-        function displayStats(stats) {
+        function updateStats(stats) {
             const statsDiv = document.getElementById('stats');
             const totalProfit = stats.total_profit || 0.0;
             const profitClass = totalProfit >= 0 ? 'success' : 'error';
             const profitSign = totalProfit >= 0 ? '+' : '';
             
-            statsDiv.innerHTML = `
-                <div class="stat-card">
-                    <h3>Всего ставок</h3>
-                    <div class="value">${stats.total_bets}</div>
-                </div>
-                <div class="stat-card success">
-                    <h3>Размещено на Polymarket</h3>
-                    <div class="value">${stats.successful_orders}</div>
-                </div>
-                <div class="stat-card ${profitClass}">
-                    <h3>Общий профит</h3>
-                    <div class="value">${profitSign}${totalProfit.toFixed(2)} USD</div>
-                </div>
-                <div class="stat-card" style="background: #fef3c7;">
-                    <h3>Пропущено</h3>
-                    <div class="value" style="color: #92400e;">${stats.skipped_orders || 0}</div>
-                </div>
-                <div class="stat-card error">
-                    <h3>Ошибок</h3>
-                    <div class="value">${stats.failed_orders}</div>
-                </div>
-                <div class="stat-card">
-                    <h3>Последнее обновление</h3>
-                    <div class="value" style="font-size: 14px;">${stats.last_update ? new Date(stats.last_update).toLocaleString('ru-RU') : 'Нет данных'}</div>
-                </div>
-            `;
+            // Плавное обновление значений
+            const statCards = statsDiv.querySelectorAll('.stat-card .value');
+            if (statCards.length > 0) {
+                // Обновляем только значения, не пересоздавая карточки
+                const values = [
+                    stats.total_bets,
+                    stats.successful_orders,
+                    `${profitSign}${totalProfit.toFixed(2)} USD`,
+                    stats.skipped_orders || 0,
+                    stats.failed_orders,
+                    stats.last_update ? new Date(stats.last_update).toLocaleString('ru-RU', { timeZone: 'Asia/Jakarta' }) : 'Нет данных'
+                ];
+                
+                statCards.forEach((el, idx) => {
+                    if (idx < values.length) {
+                        el.classList.add('updating');
+                        setTimeout(() => {
+                            el.textContent = values[idx];
+                            el.classList.remove('updating');
+                        }, 100);
+                    }
+                });
+            } else {
+                // Первая загрузка - создаем карточки
+                statsDiv.innerHTML = `
+                    <div class="stat-card">
+                        <h3>Всего ставок</h3>
+                        <div class="value">${stats.total_bets}</div>
+                    </div>
+                    <div class="stat-card success">
+                        <h3>Размещено на Polymarket</h3>
+                        <div class="value">${stats.successful_orders}</div>
+                    </div>
+                    <div class="stat-card ${profitClass}">
+                        <h3>Общий профит</h3>
+                        <div class="value">${profitSign}${totalProfit.toFixed(2)} USD</div>
+                    </div>
+                    <div class="stat-card" style="background: #fef3c7;">
+                        <h3>Пропущено</h3>
+                        <div class="value" style="color: #92400e;">${stats.skipped_orders || 0}</div>
+                    </div>
+                    <div class="stat-card error">
+                        <h3>Ошибок</h3>
+                        <div class="value">${stats.failed_orders}</div>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Последнее обновление</h3>
+                        <div class="value" style="font-size: 14px;">${stats.last_update ? new Date(stats.last_update).toLocaleString('ru-RU', { timeZone: 'Asia/Jakarta' }) : 'Нет данных'}</div>
+                    </div>
+                `;
+            }
         }
         
-        function displayBets(bets) {
+        function updateBets(bets) {
             const tbody = document.getElementById('bets-table');
+            
             if (bets.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 40px;">Нет данных о ставках</td></tr>';
+                if (tbody.children.length === 0 || tbody.children[0].cells.length !== 8) {
+                    tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 40px;">Нет данных о ставках</td></tr>';
+                }
                 return;
             }
             
-            tbody.innerHTML = bets.map(bet => {
+            // Создаем карту существующих строк по timestamp
+            const existingRows = new Map();
+            Array.from(tbody.children).forEach(row => {
+                const timestampCell = row.querySelector('.timestamp');
+                if (timestampCell) {
+                    existingRows.set(timestampCell.textContent.trim(), row);
+                }
+            });
+            
+            // Очищаем tbody для пересоздания
+            tbody.innerHTML = '';
+            
+            // Добавляем строки с анимацией для новых
+            bets.forEach((bet, index) => {
                 const betData = bet.bet_data;
                 const result = bet.result;
                 const status = result.status || 'unknown';
@@ -453,44 +561,86 @@ async def dashboard_page():
                     resultClass = '';
                 }
                 
-                return `
-                    <tr>
-                        <td class="timestamp">${formatDateTime(bet.timestamp)}</td>
-                        <td>${betData.homeTeam || '-'} vs ${betData.awayTeam || '-'}</td>
-                        <td>${betData.market || '-'}</td>
-                        <td>${betData.coef || '-'}</td>
-                        <td>${betData.surebet_profit ? betData.surebet_profit.toFixed(2) + '%' : '-'}</td>
-                        <td>${betData.second_bookmaker || '-'}</td>
-                        <td><span class="status ${statusClass}">${statusText}</span></td>
-                        <td><span class="status ${resultClass}">${resultText}</span></td>
-                    </tr>
+                const row = document.createElement('tr');
+                const timestamp = formatDateTime(bet.timestamp);
+                const isNew = !existingRows.has(timestamp);
+                
+                if (isNew && index < 5) {
+                    row.classList.add('new-row');
+                }
+                
+                row.innerHTML = `
+                    <td class="timestamp">${timestamp}</td>
+                    <td>${betData.homeTeam || '-'} vs ${betData.awayTeam || '-'}</td>
+                    <td>${betData.market || '-'}</td>
+                    <td>${betData.coef || '-'}</td>
+                    <td>${betData.surebet_profit ? betData.surebet_profit.toFixed(2) + '%' : '-'}</td>
+                    <td>${betData.second_bookmaker || '-'}</td>
+                    <td><span class="status ${statusClass}">${statusText}</span></td>
+                    <td><span class="status ${resultClass}">${resultText}</span></td>
                 `;
-            }).join('');
+                
+                tbody.appendChild(row);
+            });
         }
         
-        function displayLogs(logs) {
+        function updateLogs(logs) {
             const tbody = document.getElementById('logs-table');
+            
             if (logs.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; padding: 40px;">Нет логов</td></tr>';
+                if (tbody.children.length === 0 || tbody.children[0].cells.length !== 4) {
+                    tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; padding: 40px;">Нет логов</td></tr>';
+                }
                 return;
             }
             
-            tbody.innerHTML = logs.map(log => {
-                return `
-                    <tr>
-                        <td class="timestamp">${formatDateTime(log.timestamp)}</td>
-                        <td><span class="log-level ${log.level}">${log.level}</span></td>
-                        <td>${log.message}</td>
-                        <td class="json-data">${Object.keys(log.data || {}).length > 0 ? JSON.stringify(log.data, null, 2).substring(0, 150) : '-'}${JSON.stringify(log.data || {}).length > 150 ? '...' : ''}</td>
-                    </tr>
+            // Создаем карту существующих строк
+            const existingRows = new Map();
+            Array.from(tbody.children).forEach(row => {
+                const timestampCell = row.querySelector('.timestamp');
+                if (timestampCell) {
+                    existingRows.set(timestampCell.textContent.trim(), row);
+                }
+            });
+            
+            // Очищаем tbody
+            tbody.innerHTML = '';
+            
+            // Добавляем строки
+            logs.forEach((log, index) => {
+                const row = document.createElement('tr');
+                const timestamp = formatDateTime(log.timestamp);
+                const isNew = !existingRows.has(timestamp);
+                
+                if (isNew && index < 5) {
+                    row.classList.add('new-row');
+                }
+                
+                const jsonData = Object.keys(log.data || {}).length > 0 
+                    ? JSON.stringify(log.data, null, 2).substring(0, 150) + (JSON.stringify(log.data || {}).length > 150 ? '...' : '')
+                    : '-';
+                
+                row.innerHTML = `
+                    <td class="timestamp">${timestamp}</td>
+                    <td><span class="log-level ${log.level}">${log.level}</span></td>
+                    <td>${escapeHtml(log.message)}</td>
+                    <td class="json-data">${escapeHtml(jsonData)}</td>
                 `;
-            }).join('');
+                
+                tbody.appendChild(row);
+            });
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
         }
         
         function formatDateTime(isoString) {
             if (!isoString) return '-';
             const date = new Date(isoString);
-            return date.toLocaleString('ru-RU');
+            return date.toLocaleString('ru-RU', { timeZone: 'Asia/Jakarta' });
         }
         
         // Функции для работы с настройками
@@ -570,7 +720,7 @@ async def dashboard_page():
             
             const labels = profitData.map(d => {
                 const date = new Date(d.date);
-                return date.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' });
+                return date.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', timeZone: 'Asia/Jakarta' });
             });
             
             // Рассчитываем накопленный профит
@@ -580,10 +730,29 @@ async def dashboard_page():
                 return cumulativeProfit;
             });
             
+            // Если график уже существует, обновляем данные плавно
             if (profitChart) {
-                profitChart.destroy();
+                // Проверяем, изменились ли данные
+                const currentLabels = profitChart.data.labels;
+                const currentData = profitChart.data.datasets[0].data;
+                
+                const labelsChanged = JSON.stringify(currentLabels) !== JSON.stringify(labels);
+                const dataChanged = JSON.stringify(currentData) !== JSON.stringify(cumulativeProfits);
+                
+                if (labelsChanged || dataChanged) {
+                    profitChart.data.labels = labels;
+                    profitChart.data.datasets[0].data = cumulativeProfits;
+                    // Обновляем с плавной анимацией (duration: 500ms)
+                    profitChart.update({
+                        duration: 500,
+                        easing: 'easeInOutQuart',
+                        lazy: false
+                    });
+                }
+                return;
             }
             
+            // Создаем график только при первой загрузке
             profitChart = new Chart(ctx, {
                 type: 'line',
                 data: {
@@ -600,6 +769,24 @@ async def dashboard_page():
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
+                    animation: {
+                        duration: 750,
+                        easing: 'easeInOutQuart'
+                    },
+                    transitions: {
+                        show: {
+                            animations: {
+                                x: { from: 0 },
+                                y: { from: 0 }
+                            }
+                        },
+                        hide: {
+                            animations: {
+                                x: { to: 0 },
+                                y: { to: 0 }
+                            }
+                        }
+                    },
                     plugins: {
                         legend: {
                             display: true,
@@ -621,10 +808,10 @@ async def dashboard_page():
         }
         
         // Загружаем данные при загрузке страницы
-        loadData();
+        loadData(true);
         
-        // Автообновление каждые 5 секунд
-        setInterval(loadData, 5000);
+        // Автообновление каждые 5 секунд (без показа статуса)
+        setInterval(() => loadData(false), 5000);
     </script>
 </body>
 </html>

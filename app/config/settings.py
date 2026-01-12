@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     polymarket_clob_host: str = "https://clob.polymarket.com"
     polymarket_chain_id: int = 137  # Polygon mainnet (80001 для testnet)
     polymarket_private_key: Optional[str] = None  # Приватный ключ кошелька (БЕЗ 0x префикса или с ним)
+    polymarket_proxy_address: Optional[str] = None  # Адрес Proxy кошелька (где лежат USDC). Найти в Polymarket UI -> Profile -> Copy Address
+    polymarket_signature_type: int = 1  # 1 = Magic Link/Email, 2 = MetaMask/Browser Wallet
     
     # Прокси для CLOB API (формат: username:password@host:port или http://username:password@host:port)
     polymarket_clob_proxy: Optional[str] = "af8bUp:et9yg5VYr5Ud@mproxy.site:14470"
