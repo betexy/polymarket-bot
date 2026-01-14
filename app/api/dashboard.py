@@ -244,11 +244,13 @@ async def dashboard_page():
                         <tr>
                             <th>Время</th>
                             <th>Команды</th>
-                            <th>Рынок</th>
+                            <th>Маркет</th>
                             <th>Коэффициент</th>
                             <th>Прибыль %</th>
                             <th>Second BK</th>
+                            <th>Источник</th>
                             <th>Статус</th>
+                            <th>Сумма ставки</th>
                             <th>Результат</th>
                         </tr>
                     </thead>
@@ -515,8 +517,8 @@ async def dashboard_page():
             const tbody = document.getElementById('bets-table');
             
             if (bets.length === 0) {
-                if (tbody.children.length === 0 || tbody.children[0].cells.length !== 8) {
-                    tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 40px;">Нет данных о ставках</td></tr>';
+                if (tbody.children.length === 0 || tbody.children[0].cells.length !== 10) {
+                    tbody.innerHTML = '<tr><td colspan="10" style="text-align: center; padding: 40px;">Нет данных о ставках</td></tr>';
                 }
                 return;
             }
@@ -541,16 +543,22 @@ async def dashboard_page():
                 const statusClass = status === 'success' ? 'success' : status === 'error' ? 'error' : 'skipped';
                 const statusText = status === 'success' ? 'Успешно' : status === 'error' ? 'Ошибка' : 'Пропущено';
                 
+                // Получаем информацию о сумме ставки
+                const betAmountUsd = bet.bet_amount_usd || (result.order_price && result.order_size ? result.order_price * result.order_size : null);
+                const betAmountText = betAmountUsd ? `$${betAmountUsd.toFixed(2)}` : '-';
+                
                 // Получаем информацию о результате
-                const profit = result.profit;
-                const resultStatus = result.result_status || (result.profit !== null && result.profit !== undefined ? (result.profit >= 0 ? 'win' : 'loss') : 'pending');
+                const settledStatus = bet.settled_status;
+                const outcome = bet.outcome;
+                const profit = bet.profit !== null && bet.profit !== undefined ? bet.profit : result.profit;
+                const resultStatus = settledStatus || result.result_status || (profit !== null && profit !== undefined ? (profit >= 0 ? 'win' : 'loss') : 'pending');
                 let resultText = '-';
                 let resultClass = '';
                 
-                if (resultStatus === 'win') {
+                if (settledStatus === 'WIN' || (resultStatus === 'win' && outcome === 'WIN')) {
                     resultText = `✅ Выигрыш: +${profit ? profit.toFixed(2) : '0.00'} USD`;
                     resultClass = 'success';
-                } else if (resultStatus === 'loss') {
+                } else if (settledStatus === 'LOSE' || (resultStatus === 'loss' && outcome === 'LOSE')) {
                     resultText = `❌ Проигрыш: ${profit ? profit.toFixed(2) : '0.00'} USD`;
                     resultClass = 'error';
                 } else if (resultStatus === 'closed') {
@@ -569,14 +577,20 @@ async def dashboard_page():
                     row.classList.add('new-row');
                 }
                 
+                // Используем market_display если доступно, иначе fallback к betData.market
+                const marketDisplay = bet.market_display || betData.market || '-';
+                const source = bet.source || betData.source || '-';
+                
                 row.innerHTML = `
                     <td class="timestamp">${timestamp}</td>
                     <td>${betData.homeTeam || '-'} vs ${betData.awayTeam || '-'}</td>
-                    <td>${betData.market || '-'}</td>
+                    <td>${marketDisplay}</td>
                     <td>${betData.coef || '-'}</td>
                     <td>${betData.surebet_profit ? betData.surebet_profit.toFixed(2) + '%' : '-'}</td>
                     <td>${betData.second_bookmaker || '-'}</td>
+                    <td>${source}</td>
                     <td><span class="status ${statusClass}">${statusText}</span></td>
+                    <td>${betAmountText}</td>
                     <td><span class="status ${resultClass}">${resultText}</span></td>
                 `;
                 

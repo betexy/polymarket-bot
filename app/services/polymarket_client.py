@@ -315,19 +315,34 @@ class PolymarketClient:
         """
         Получение markets для события
         
-        API: GET /markets?event_id=<event_id>
+        Правильный API: GET /events/{event_id} (маркеты включены в ответ события)
         """
-        params = {"event_id": event_id}
         try:
-            response = await self._make_request("GET", "/markets", params=params)
-            markets_count = len(response) if isinstance(response, list) else 'unknown'
-            logger.info(f"Markets response: found {markets_count} markets")
+            # Получаем событие целиком - маркеты включены в ответ
+            response = await self._make_request("GET", f"/events/{event_id}")
             
-            if isinstance(response, list) and response:
-                first_market = response[0]
-                logger.info(f"First market sample: {first_market.get('id')}, {first_market.get('question')}")
+            # Извлекаем маркеты из ответа
+            markets = []
+            if isinstance(response, dict):
+                # Маркеты могут быть в разных полях
+                markets = response.get("markets", response.get("data", {}).get("markets", []))
+                if not markets:
+                    # Если markets нет напрямую, может быть вложенная структура
+                    data = response.get("data", response)
+                    if isinstance(data, dict):
+                        markets = data.get("markets", [])
+            elif isinstance(response, list):
+                # Если ответ - список, это уже маркеты
+                markets = response
             
-            return response if isinstance(response, list) else []
+            markets_count = len(markets) if isinstance(markets, list) else 0
+            logger.info(f"Markets for event {event_id}: found {markets_count} markets")
+            
+            if markets and isinstance(markets, list) and len(markets) > 0:
+                first_market = markets[0]
+                logger.info(f"First market sample: {first_market.get('id')}, {first_market.get('question', first_market.get('title', 'N/A'))[:60]}")
+            
+            return markets if isinstance(markets, list) else []
         except Exception as e:
             logger.error(f"Error getting markets for event {event_id}: {e}")
             return []
@@ -439,7 +454,15 @@ class PolymarketClient:
         
         # Если не нашли и это TOTAL, логируем для отладки
         if market_type in ["TOTAL", "T1_TOTAL", "T2_TOTAL"] and total_markets:
-            logger.debug(f"TOTAL markets found ({len(total_markets)}) but filters didn't match. pivot={pivot}, target={target}. Sample markets: {[m['question'][:60] for m in total_markets[:3]]}")
+            logger.warning(f"TOTAL markets found ({len(total_markets)}) but filters didn't match. pivot={pivot}, target={target}")
+            # Детальное логирование для каждого маркета
+            for m in total_markets[:5]:
+                market_text_for_check = f"{m.get('title', '')} {m.get('question', '')}"
+                pivot_match = self._check_pivot_match(market_text_for_check.upper(), pivot) if pivot else True
+                target_match = self._check_target_match(market_text_for_check.lower(), target, market_type, home_teams, away_teams) if target else True
+                logger.warning(f"  Market ID {m.get('id')}: question='{m.get('question', 'N/A')[:60]}', pivot_match={pivot_match}, target_match={target_match}")
+                if pivot:
+                    logger.warning(f"    Pivot check: pivot={pivot}, market_text='{market_text_for_check[:100]}'")
         
         return None
     
@@ -517,6 +540,16 @@ class PolymarketClient:
                 target_lower = "home"
             elif target_lower == "two":
                 target_lower = "away"
+            
+            # Для ONE_DRAW (1X) - принимаем любой ONE_TWO маркет (так как 1X - это комбинация HOME или DRAW)
+            if target_lower in ["one_draw", "1x", "1 x"]:
+                # Для 1X принимаем любой ONE_TWO маркет (будет обработано при размещении ордера)
+                return True
+            
+            # Для TWO_DRAW (X2) - принимаем любой ONE_TWO маркет
+            if target_lower in ["two_draw", "x2", "x 2"]:
+                # Для X2 принимаем любой ONE_TWO маркет
+                return True
             
             # Для 1X2 (Moneyline) target может быть "1", "X", "2", "HOME", "AWAY" или названия команд
             # Проверяем различные варианты обозначения HOME/TEAM 1
