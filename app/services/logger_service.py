@@ -93,12 +93,24 @@ class LogStorage:
                 cursor.execute("ALTER TABLE bets ADD COLUMN settled_at TEXT")
             except sqlite3.OperationalError:
                 pass
-            
+
+            try:
+                cursor.execute("ALTER TABLE bets ADD COLUMN redeemed INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+
+            try:
+                cursor.execute("ALTER TABLE bets ADD COLUMN redeemed_at TEXT")
+            except sqlite3.OperationalError:
+                pass
+
             # Индексы для быстрого поиска
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON bets(timestamp)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_status ON bets(status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_order_id ON bets(order_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_market_id ON bets(market_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_status_market ON bets(status, market_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_token_id ON bets(token_id)")
             
             conn.commit()
             conn.close()
@@ -122,12 +134,17 @@ class LogStorage:
             status = result.get("status")
             if status == "success":
                 self.stats["successful_orders"] += 1
-                # Сохраняем успешные ставки в базу данных
                 self._save_bet_to_db(timestamp, bet_data, result)
             elif status == "error":
                 self.stats["failed_orders"] += 1
+                self._save_bet_to_db(timestamp, bet_data, result)
             elif status == "skipped":
                 self.stats["skipped_orders"] += 1
+                # Save interesting skips (exclude trivial filter reasons)
+                skip_reason = result.get("reason", "")
+                trivial_skips = {"second_bookmaker_not_allowed", "not_polymarket"}
+                if skip_reason not in trivial_skips:
+                    self._save_bet_to_db(timestamp, bet_data, result)
     
     def _save_bet_to_db(self, timestamp: str, bet_data: Dict[str, Any], result: Dict[str, Any]):
         """Сохранение ставки в базу данных"""
@@ -175,6 +192,32 @@ class LogStorage:
             conn.close()
         except Exception as e:
             logger.error(f"Error saving bet to database: {e}", exc_info=True)
+    
+    def _update_order_info_in_db(self, order_id: str, order_price: float, order_size: float) -> bool:
+        """Обновление информации об ордере (цена и размер) в БД"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                UPDATE bets
+                SET order_price = ?, order_size = ?, bet_amount_usd = ?
+                WHERE order_id = ?
+            """, (order_price, order_size, order_price * order_size, order_id))
+            
+            conn.commit()
+            updated = cursor.rowcount > 0
+            conn.close()
+            
+            if updated:
+                logger.info(f"Updated order info in DB: order_id={order_id}, price={order_price}, size={order_size}")
+            else:
+                logger.warning(f"Order not found for update: order_id={order_id}")
+            
+            return updated
+        except Exception as e:
+            logger.error(f"Error updating order info in DB: {e}", exc_info=True)
+            return False
     
     def _delete_bet_from_db(self, order_id: str) -> bool:
         """Удаление ставки из базы данных по order_id"""
@@ -249,6 +292,13 @@ class LogStorage:
                         # Вычисляем сумму ставки если не сохранена
                         bet_amount_usd = float(row["order_price"]) * float(row["order_size"])
                     
+                    # Рассчитываем ROI (Return on Investment)
+                    roi = None
+                    profit = row["profit"] if "profit" in row_keys else None
+                    if profit is not None and bet_amount_usd and bet_amount_usd > 0:
+                        # ROI = (Profit / Investment) * 100%
+                        roi = (float(profit) / float(bet_amount_usd)) * 100
+                    
                     bets.append({
                         "timestamp": row["timestamp"],
                         "bet_data": bet_data,
@@ -257,7 +307,8 @@ class LogStorage:
                         "bet_amount_usd": bet_amount_usd,
                         "settled_status": row["settled_status"] if "settled_status" in row_keys else None,
                         "outcome": row["outcome"] if "outcome" in row_keys else None,
-                        "profit": row["profit"] if "profit" in row_keys else None,
+                        "profit": profit,
+                        "roi": roi,  # ROI в процентах
                         "source": bet_data.get("source")  # Источник парсера
                     })
                 except Exception as e:
@@ -298,8 +349,31 @@ class LogStorage:
             cursor.execute("SELECT COALESCE(SUM(profit), 0) FROM bets WHERE profit IS NOT NULL")
             total_profit = cursor.fetchone()[0] or 0.0
             
-            cursor.execute("SELECT COALESCE(SUM(order_size * order_price), 0) FROM bets WHERE status = 'success' AND order_size IS NOT NULL AND order_price IS NOT NULL")
-            total_invested = cursor.fetchone()[0] or 0.0
+            # Общий оборот = сумма всех успешных ставок в долларах
+            cursor.execute("""
+                SELECT COALESCE(SUM(bet_amount_usd), 0) 
+                FROM bets 
+                WHERE status = 'success' AND bet_amount_usd IS NOT NULL
+            """)
+            total_turnover = cursor.fetchone()[0] or 0.0
+            
+            # Если bet_amount_usd нет, используем order_size * order_price как fallback
+            if total_turnover == 0:
+                cursor.execute("""
+                    SELECT COALESCE(SUM(order_size * order_price), 0) 
+                    FROM bets 
+                    WHERE status = 'success' AND order_size IS NOT NULL AND order_price IS NOT NULL
+                """)
+                total_turnover = cursor.fetchone()[0] or 0.0
+            
+            # Для совместимости сохраняем total_invested
+            total_invested = total_turnover
+            
+            # Рассчитываем общий ROI (Return on Investment)
+            # ROI = (Total Profit / Total Turnover) * 100%
+            total_roi = None
+            if total_turnover > 0:
+                total_roi = (total_profit / total_turnover) * 100
             
             cursor.execute("SELECT MAX(timestamp) FROM bets")
             last_update = cursor.fetchone()[0]
@@ -313,6 +387,8 @@ class LogStorage:
                 "skipped_orders": skipped_orders,
                 "total_profit": float(total_profit),
                 "total_invested": float(total_invested),
+                "total_turnover": float(total_turnover),  # Общий оборот в долларах
+                "total_roi": float(total_roi) if total_roi is not None else None,  # Общий ROI в процентах
                 "last_update": last_update
             }
         except Exception as e:

@@ -15,7 +15,13 @@ class Settings(BaseSettings):
     polymarket_private_key: Optional[str] = None  # Приватный ключ кошелька (БЕЗ 0x префикса или с ним)
     polymarket_proxy_address: Optional[str] = None  # Адрес Proxy кошелька (где лежат USDC). Найти в Polymarket UI -> Profile -> Copy Address
     polymarket_signature_type: int = 1  # 1 = Magic Link/Email, 2 = MetaMask/Browser Wallet
-    
+
+    # Builder API ключи (для Relayer — redeem, gasless транзакции)
+    # Получить на polymarket.com/settings?tab=builder
+    polymarket_builder_api_key: Optional[str] = None
+    polymarket_builder_secret: Optional[str] = None
+    polymarket_builder_passphrase: Optional[str] = None
+
     # Прокси для CLOB API (формат: username:password@host:port или http://username:password@host:port)
     polymarket_clob_proxy: Optional[str] = "af8bUp:et9yg5VYr5Ud@mproxy.site:14470"
     

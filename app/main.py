@@ -7,7 +7,10 @@ import asyncio
 from app.config.settings import Settings
 from app.api import bets, dashboard
 from app.dependencies import get_order_manager
-from app.services.background_tasks import parse_events_periodically
+from app.services.background_tasks import parse_events_periodically, check_bets_status_periodically, poll_bets_periodically, redeem_winnings_periodically
+from app.services.bet_status_checker import BetStatusChecker
+from app.services.bet_poller import BetPoller
+from app.services.winnings_redeemer import WinningsRedeemer
 
 # Настройка логирования
 logging.basicConfig(
@@ -26,8 +29,8 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Polymarket Bot API Server...")
     logger.info(f"API will be available at http://{settings.api_host}:{settings.api_port}")
     
-    # Получаем event_parser из уже инициализированного клиента
-    from app.dependencies import _polymarket_client
+    # Получаем event_parser и clob_client из уже инициализированных клиентов
+    from app.dependencies import _polymarket_client, _clob_client, get_order_manager
     
     # Запускаем периодический парсинг событий в фоне (раз в 3 часа)
     parsing_task = asyncio.create_task(
@@ -38,15 +41,68 @@ async def lifespan(app: FastAPI):
     # Парсим 30-40k событий (400 страниц), растягиваем на час
     asyncio.create_task(_polymarket_client.event_parser.parse_all_events(max_pages=400, target_duration_minutes=60))
     
+    # Запускаем периодическую проверку статуса ставок (раз в час)
+    bet_status_checker = None
+    bet_status_task = None
+    if _polymarket_client:
+        bet_status_checker = BetStatusChecker(_polymarket_client)
+        bet_status_task = asyncio.create_task(
+            check_bets_status_periodically(bet_status_checker, interval_minutes=60)
+        )
+        logger.info("Bet status checking task started (every 1 hour)")
+    else:
+        logger.warning("Polymarket client not available, bet status checking will not run")
+    
+    # Запускаем автоматический redeem выигрышных позиций (раз в 5 минут)
+    redeem_task = None
+    winnings_redeemer = WinningsRedeemer(settings)
+    redeem_task = asyncio.create_task(
+        redeem_winnings_periodically(winnings_redeemer, interval_minutes=5)
+    )
+    logger.info("Winnings redeem task started (every 5 minutes)")
+
+    # Запускаем получение ставок с парсера (раз в секунду)
+    bet_poller_task = None
+    try:
+        from app.dependencies import _order_manager
+        bet_poller = BetPoller(_order_manager, poll_url="http://bcp.bet/abb_pairs_pre_poly/")
+        bet_poller_task = asyncio.create_task(
+            poll_bets_periodically(bet_poller, interval_seconds=1.0)
+        )
+        logger.info("Bet polling task started (every 1 second)")
+    except Exception as e:
+        logger.warning(f"Could not start bet polling task: {e}")
+    
     yield
     
     # Shutdown
     logger.info("Shutting down Polymarket Bot API Server...")
     parsing_task.cancel()
+    if bet_status_task:
+        bet_status_task.cancel()
+    if redeem_task:
+        redeem_task.cancel()
+    if bet_poller_task:
+        bet_poller_task.cancel()
     try:
         await parsing_task
     except asyncio.CancelledError:
         pass
+    if bet_status_task:
+        try:
+            await bet_status_task
+        except asyncio.CancelledError:
+            pass
+    if redeem_task:
+        try:
+            await redeem_task
+        except asyncio.CancelledError:
+            pass
+    if bet_poller_task:
+        try:
+            await bet_poller_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(
