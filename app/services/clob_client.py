@@ -14,6 +14,17 @@ except ImportError:
     CLOB_AVAILABLE = False
     logger.warning("py-clob-client not installed. CLOB functionality will be disabled.")
 
+try:
+    from web3 import Web3
+    WEB3_AVAILABLE = True
+except ImportError:
+    WEB3_AVAILABLE = False
+    logger.warning("web3 not installed. Direct balance check will be disabled.")
+
+# USDC contract on Polygon
+USDC_CONTRACT_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+USDC_ABI = [{"constant": True, "inputs": [{"name": "_owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"}]
+
 
 class PolymarketCLOBClient:
     """
@@ -204,18 +215,14 @@ class PolymarketCLOBClient:
                     except Exception as e2:
                         logger.error(f"Failed to create new API credentials: {e2}")
                         raise e  # Пробрасываем оригинальную ошибку
-                # Если ошибка "not enough balance / allowance", пытаемся обновить allowance
+                # Если ошибка "not enough balance / allowance", не пытаемся обновить allowance
+                # При использовании Proxy Wallet update_balance_allowance() не работает
+                # Allowance должен быть установлен вручную через веб-интерфейс или через скрипт
                 elif "not enough balance" in error_msg.lower() or "not enough allowance" in error_msg.lower() or "allowance" in error_msg.lower():
-                    logger.warning(f"Insufficient balance/allowance: {e}. Attempting to update allowance...")
-                    try:
-                        # Обновляем allowance
-                        self.update_balance_allowance()
-                        logger.info("Allowance updated. Retrying order...")
-                        # Повторная попытка
-                        response = self._client.create_and_post_order(order_args)
-                    except Exception as e2:
-                        logger.error(f"Failed to update allowance or retry order: {e2}")
-                        raise e  # Пробрасываем оригинальную ошибку
+                    logger.warning(f"Insufficient balance/allowance: {e}")
+                    if hasattr(self.settings, 'polymarket_proxy_address') and self.settings.polymarket_proxy_address:
+                        logger.warning(f"Proxy Wallet mode: allowance must be set manually. Check balance on: {self.settings.polymarket_proxy_address}")
+                    raise e  # Пробрасываем ошибку без попытки обновить allowance
                 else:
                     raise  # Пробрасываем другие ошибки
             
@@ -259,7 +266,7 @@ class PolymarketCLOBClient:
         
         try:
             logger.info(f"Canceling order: {order_id}")
-            response = self._client.cancel_order(order_id=order_id)
+            response = self._client.cancel(order_id)
             logger.info(f"Order canceled: {order_id}")
             return response
         except Exception as e:
@@ -394,6 +401,37 @@ class PolymarketCLOBClient:
             logger.error(f"Error updating balance allowance: {e}", exc_info=True)
             raise
     
+    def get_usdc_balance_direct(self, address: str) -> Optional[float]:
+        """
+        Прямая проверка баланса USDC через Web3 (не через py-clob-client)
+        Работает для любого адреса, включая Proxy Wallet
+        
+        Args:
+            address: Адрес кошелька для проверки
+            
+        Returns:
+            Баланс в USDC или None при ошибке
+        """
+        if not WEB3_AVAILABLE:
+            logger.warning("Web3 not available for direct balance check")
+            return None
+        
+        try:
+            w3 = Web3(Web3.HTTPProvider('https://polygon-bor-rpc.publicnode.com'))
+            usdc_contract = w3.eth.contract(
+                address=Web3.to_checksum_address(USDC_CONTRACT_ADDRESS),
+                abi=USDC_ABI
+            )
+            balance_wei = usdc_contract.functions.balanceOf(
+                Web3.to_checksum_address(address)
+            ).call()
+            balance_usdc = balance_wei / 1e6  # USDC has 6 decimals
+            logger.info(f"Direct USDC balance check: {address} = ${balance_usdc:.2f}")
+            return balance_usdc
+        except Exception as e:
+            logger.error(f"Error getting USDC balance directly: {e}")
+            return None
+    
     def check_balance_and_allowance(self, required_amount: float) -> Dict[str, Any]:
         """
         Проверка баланса и allowance перед размещением ордера
@@ -420,48 +458,60 @@ class PolymarketCLOBClient:
             }
         
         try:
-            # Получаем адрес кошелька
+            # Получаем адрес кошелька (для Proxy Wallet это будет EOA)
             address = self.get_address()
-            
-            # Пытаемся получить баланс и allowance
-            # Если метод требует параметры, пропускаем проверку и полагаемся на автоматическое обновление при ошибке
             balance = None
             allowance = None
-            needs_allowance_update = True  # По умолчанию предполагаем, что нужно обновить
+            needs_allowance_update = True
             
-            try:
-                balance_allowance_info = self._client.get_balance_allowance()
-                
-                if isinstance(balance_allowance_info, dict):
-                    # Пытаемся извлечь баланс из разных возможных полей
-                    balance = float(balance_allowance_info.get("balance", 
-                        balance_allowance_info.get("available", 
-                        balance_allowance_info.get("usdc", 
-                        balance_allowance_info.get("usdcBalance", 0)))))
+            # Определяем адрес для проверки баланса
+            # Для Proxy Wallet проверяем баланс на Proxy адресе, а не EOA
+            balance_check_address = address
+            if hasattr(self.settings, 'polymarket_proxy_address') and self.settings.polymarket_proxy_address:
+                balance_check_address = self.settings.polymarket_proxy_address
+                logger.info(f"Using Proxy Wallet address for balance check: {balance_check_address}")
+            
+            # ВАЖНО: Прямая проверка баланса USDC через Web3
+            # Это работает для любого адреса, включая Proxy Wallet
+            balance = self.get_usdc_balance_direct(balance_check_address)
+            
+            if balance is None:
+                # Fallback: пытаемся через py-clob-client (работает только для EOA)
+                try:
+                    balance_allowance_info = self._client.get_balance_allowance()
                     
-                    # Пытаемся извлечь allowance
-                    allowance = float(balance_allowance_info.get("allowance",
-                        balance_allowance_info.get("usdc_allowance",
-                        balance_allowance_info.get("usdcAllowance", 0))))
-                    
-                    needs_allowance_update = allowance < required_amount if allowance is not None else True
-                elif isinstance(balance_allowance_info, (int, float)):
-                    balance = float(balance_allowance_info)
-            except Exception as e:
-                logger.warning(f"Could not get balance/allowance directly: {e}. Will rely on automatic allowance update on error.")
-                # Продолжаем без проверки, полагаясь на автоматическое обновление при ошибке
+                    if isinstance(balance_allowance_info, dict):
+                        balance = float(balance_allowance_info.get("balance", 
+                            balance_allowance_info.get("available", 
+                            balance_allowance_info.get("usdc", 
+                            balance_allowance_info.get("usdcBalance", 0)))))
+                        
+                        allowance = float(balance_allowance_info.get("allowance",
+                            balance_allowance_info.get("usdc_allowance",
+                            balance_allowance_info.get("usdcAllowance", 0))))
+                        
+                        needs_allowance_update = allowance < required_amount if allowance is not None else True
+                    elif isinstance(balance_allowance_info, (int, float)):
+                        balance = float(balance_allowance_info)
+                except Exception as e:
+                    logger.warning(f"Fallback balance check failed: {e}")
+            
+            # Результат проверки
+            has_balance = balance >= required_amount if balance is not None else None
             
             result = {
-                "has_balance": balance >= required_amount if balance is not None else None,
+                "has_balance": has_balance,
                 "has_allowance": allowance >= required_amount if allowance is not None else None,
                 "balance": balance,
                 "allowance": allowance,
-                "address": address,
+                "address": balance_check_address,
+                "eoa_address": address,
                 "needs_allowance_update": needs_allowance_update,
                 "required_amount": required_amount
             }
             
-            logger.info(f"Balance check: balance={balance}, allowance={allowance}, required={required_amount}, address={address}")
+            balance_str = f"${balance:.2f}" if balance is not None else "N/A"
+            logger.info(f"Balance check: address={balance_check_address}, balance={balance_str}, required=${required_amount:.2f}, has_balance={has_balance}")
             
             return result
             

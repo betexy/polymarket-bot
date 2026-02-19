@@ -252,21 +252,32 @@ class LogStorage:
             }
             self.api_logs.appendleft(entry)  # Новые сначала
     
-    def get_recent_bets(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def get_recent_bets(self, limit: int = 100, status_filter: str = None) -> List[Dict[str, Any]]:
         """Получение последних ставок из базы данных"""
         try:
             conn = sqlite3.connect(self.db_path)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            
-            cursor.execute("""
-                SELECT timestamp, bet_data_json, result_json, market_type, target,
-                       order_price, order_size, bet_amount_usd,
-                       settled_status, outcome, profit
-                FROM bets
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """, (limit,))
+
+            if status_filter:
+                cursor.execute("""
+                    SELECT timestamp, bet_data_json, result_json, market_type, target,
+                           order_price, order_size, bet_amount_usd,
+                           settled_status, outcome, profit
+                    FROM bets
+                    WHERE status = ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                """, (status_filter, limit))
+            else:
+                cursor.execute("""
+                    SELECT timestamp, bet_data_json, result_json, market_type, target,
+                           order_price, order_size, bet_amount_usd,
+                           settled_status, outcome, profit
+                    FROM bets
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                """, (limit,))
             
             rows = cursor.fetchall()
             conn.close()

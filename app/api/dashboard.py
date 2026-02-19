@@ -4,6 +4,8 @@ from pydantic import BaseModel
 from typing import Optional
 from app.services.logger_service import log_storage
 from app.services.settings_service import get_settings_service
+from app.services.bet_status_checker import BetStatusChecker
+from app.dependencies import _polymarket_client, _clob_client, _settings
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -24,6 +26,7 @@ async def dashboard_page():
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Polymarket Bot - Dashboard</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%233b82f6'/><text y='.9em' x='50%' text-anchor='middle' font-size='70'>🤖</text></svg>">
     <style>
         * {
             margin: 0;
@@ -211,6 +214,91 @@ async def dashboard_page():
             white-space: pre-wrap;
             word-break: break-all;
         }
+        /* Стили для раскрывающихся деталей ставки */
+        .bet-row {
+            cursor: pointer;
+        }
+        .bet-row:hover {
+            background: #f0f9ff !important;
+        }
+        .bet-row.expanded {
+            background: #eff6ff !important;
+        }
+        .bet-details-row {
+            display: none;
+        }
+        .bet-details-row.expanded {
+            display: table-row;
+        }
+        .bet-details-row td {
+            background: #f8fafc;
+            padding: 0;
+            border-bottom: 2px solid #e5e7eb;
+        }
+        .bet-details-content {
+            padding: 15px 20px;
+            animation: slideDown 0.2s ease-out;
+        }
+        @keyframes slideDown {
+            from { opacity: 0; max-height: 0; }
+            to { opacity: 1; max-height: 500px; }
+        }
+        .bet-details-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+        }
+        .bet-details-section {
+            background: white;
+            border-radius: 8px;
+            padding: 15px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .bet-details-section h4 {
+            color: #374151;
+            font-size: 14px;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        .bet-detail-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 6px 0;
+            font-size: 13px;
+            border-bottom: 1px solid #f3f4f6;
+        }
+        .bet-detail-item:last-child {
+            border-bottom: none;
+        }
+        .bet-detail-label {
+            color: #6b7280;
+            font-weight: 500;
+        }
+        .bet-detail-value {
+            color: #111827;
+            font-weight: 500;
+            text-align: right;
+            max-width: 60%;
+            word-break: break-all;
+        }
+        .expand-indicator {
+            display: inline-block;
+            width: 18px;
+            height: 18px;
+            text-align: center;
+            line-height: 18px;
+            background: #e5e7eb;
+            border-radius: 4px;
+            font-size: 12px;
+            margin-right: 8px;
+            transition: transform 0.2s ease;
+        }
+        .bet-row.expanded .expand-indicator {
+            transform: rotate(90deg);
+            background: #3b82f6;
+            color: white;
+        }
     </style>
 </head>
 <body>
@@ -251,6 +339,7 @@ async def dashboard_page():
                             <th>Источник</th>
                             <th>Статус</th>
                             <th>Сумма ставки</th>
+                            <th>ROI</th>
                             <th>Результат</th>
                         </tr>
                     </thead>
@@ -392,13 +481,20 @@ async def dashboard_page():
                 }
                 
                 // Параллельная загрузка всех данных
-                const [statsResponse, betsResponse, logsResponse, profitResponse] = await Promise.all([
+                const [statsResponse, betsResponse, logsResponse, profitResponse, balanceResponse] = await Promise.all([
                     fetch('/dashboard/api/stats?_=' + Date.now()),
                     fetch('/dashboard/api/bets-history?_=' + Date.now()),
                     fetch('/dashboard/api/logs-history?_=' + Date.now()),
-                    fetch('/dashboard/api/profit-data?days=30&_=' + Date.now())
+                    fetch('/dashboard/api/profit-data?days=30&_=' + Date.now()),
+                    fetch('/dashboard/api/balance?_=' + Date.now())
                 ]);
-                
+
+                // Обрабатываем баланс
+                if (balanceResponse.ok) {
+                    const balData = await balanceResponse.json();
+                    cachedData.balance = balData;
+                }
+
                 // Обрабатываем статистику
                 if (statsResponse.ok) {
                     const stats = await statsResponse.json();
@@ -459,69 +555,61 @@ async def dashboard_page():
             const totalProfit = stats.total_profit || 0.0;
             const profitClass = totalProfit >= 0 ? 'success' : 'error';
             const profitSign = totalProfit >= 0 ? '+' : '';
+            const totalTurnover = stats.total_turnover || stats.total_invested || 0;
+            const skippedOrders = stats.skipped_orders || 0;
+            const failedOrders = stats.failed_orders || 0;
             
-            // Плавное обновление значений
-            const statCards = statsDiv.querySelectorAll('.stat-card .value');
-            if (statCards.length > 0) {
-                // Обновляем только значения, не пересоздавая карточки
-                const values = [
-                    stats.total_bets,
-                    stats.successful_orders,
-                    `${profitSign}${totalProfit.toFixed(2)} USD`,
-                    stats.skipped_orders || 0,
-                    stats.failed_orders,
-                    stats.last_update ? new Date(stats.last_update).toLocaleString('ru-RU', { timeZone: 'Asia/Jakarta' }) : 'Нет данных'
-                ];
-                
-                statCards.forEach((el, idx) => {
-                    if (idx < values.length) {
-                        el.classList.add('updating');
-                        setTimeout(() => {
-                            el.textContent = values[idx];
-                            el.classList.remove('updating');
-                        }, 100);
-                    }
-                });
-            } else {
-                // Первая загрузка - создаем карточки
-                statsDiv.innerHTML = `
-                    <div class="stat-card">
-                        <h3>Всего ставок</h3>
-                        <div class="value">${stats.total_bets}</div>
-                    </div>
-                    <div class="stat-card success">
-                        <h3>Размещено на Polymarket</h3>
-                        <div class="value">${stats.successful_orders}</div>
-                    </div>
-                    <div class="stat-card ${profitClass}">
-                        <h3>Общий профит</h3>
-                        <div class="value">${profitSign}${totalProfit.toFixed(2)} USD</div>
-                    </div>
-                    <div class="stat-card" style="background: #fef3c7;">
-                        <h3>Пропущено</h3>
-                        <div class="value" style="color: #92400e;">${stats.skipped_orders || 0}</div>
-                    </div>
-                    <div class="stat-card error">
-                        <h3>Ошибок</h3>
-                        <div class="value">${stats.failed_orders}</div>
-                    </div>
-                    <div class="stat-card">
-                        <h3>Последнее обновление</h3>
-                        <div class="value" style="font-size: 14px;">${stats.last_update ? new Date(stats.last_update).toLocaleString('ru-RU', { timeZone: 'Asia/Jakarta' }) : 'Нет данных'}</div>
-                    </div>
-                `;
-            }
+            // Рассчитываем общий ROI
+            const totalROI = stats.total_roi !== null && stats.total_roi !== undefined ? stats.total_roi : null;
+            const roiText = totalROI !== null ? (totalROI >= 0 ? '+' : '') + totalROI.toFixed(2) + '%' : '-';
+            const roiClass = totalROI !== null ? (totalROI >= 0 ? 'success' : 'error') : '';
+            
+            // Баланс
+            const bal = cachedData.balance;
+            const balanceText = bal && bal.balance !== null && bal.balance !== undefined
+                ? '$' + bal.balance.toFixed(2)
+                : '-';
+
+            statsDiv.innerHTML = `
+                <div class="stat-card" style="background: #ecfdf5;">
+                    <h3>Баланс USDC</h3>
+                    <div class="value" style="color: #047857;">${balanceText}</div>
+                </div>
+                <div class="stat-card success">
+                    <h3>Ставок на Полимаркет</h3>
+                    <div class="value">${stats.successful_orders}</div>
+                </div>
+                <div class="stat-card" style="background: #e0e7ff;">
+                    <h3>Оборот</h3>
+                    <div class="value" style="color: #3730a3;">${totalTurnover.toFixed(2)} USD</div>
+                </div>
+                <div class="stat-card ${roiClass}">
+                    <h3>ROI</h3>
+                    <div class="value">${roiText}</div>
+                </div>
+                <div class="stat-card ${profitClass}">
+                    <h3>Профит</h3>
+                    <div class="value">${profitSign}${totalProfit.toFixed(2)} USD</div>
+                </div>
+                <div class="stat-card" style="background: #fef3c7;">
+                    <h3>Пропущено / Ошибок</h3>
+                    <div class="value" style="color: #92400e;">${skippedOrders} / ${failedOrders}</div>
+                </div>
+            `;
         }
         
         function updateBets(bets) {
             const tbody = document.getElementById('bets-table');
             
             if (bets.length === 0) {
-                if (tbody.children.length === 0 || tbody.children[0].cells.length !== 10) {
-                    tbody.innerHTML = '<tr><td colspan="10" style="text-align: center; padding: 40px;">Нет данных о ставках</td></tr>';
+                if (tbody.children.length === 0 || tbody.children[0].cells.length !== 11) {
+                    tbody.innerHTML = '<tr><td colspan="11" style="text-align: center; padding: 40px;">Нет данных о ставках</td></tr>';
                 }
                 return;
             }
+            
+            // Получаем состояние раскрытых строк из localStorage
+            const expandedStates = getExpandedStates();
             
             // Создаем карту существующих строк по timestamp
             const existingRows = new Map();
@@ -572,30 +660,277 @@ async def dashboard_page():
                 const row = document.createElement('tr');
                 const timestamp = formatDateTime(bet.timestamp);
                 const isNew = !existingRows.has(timestamp);
+                const isExpanded = expandedStates[timestamp] === true;
+                
+                row.classList.add('bet-row');
+                row.dataset.betIndex = index;
                 
                 if (isNew && index < 5) {
                     row.classList.add('new-row');
+                }
+                if (isExpanded) {
+                    row.classList.add('expanded');
                 }
                 
                 // Используем market_display если доступно, иначе fallback к betData.market
                 const marketDisplay = bet.market_display || betData.market || '-';
                 const source = bet.source || betData.source || '-';
                 
+                // Форматируем ROI
+                let roiText = '-';
+                let roiClass = '';
+                if (bet.roi !== null && bet.roi !== undefined) {
+                    const roi = parseFloat(bet.roi);
+                    if (!isNaN(roi)) {
+                        roiText = (roi >= 0 ? '+' : '') + roi.toFixed(2) + '%';
+                        roiClass = roi >= 0 ? 'success' : 'error';
+                    }
+                }
+                
                 row.innerHTML = `
-                    <td class="timestamp">${timestamp}</td>
-                    <td>${betData.homeTeam || '-'} vs ${betData.awayTeam || '-'}</td>
-                    <td>${marketDisplay}</td>
-                    <td>${betData.coef || '-'}</td>
-                    <td>${betData.surebet_profit ? betData.surebet_profit.toFixed(2) + '%' : '-'}</td>
-                    <td>${betData.second_bookmaker || '-'}</td>
-                    <td>${source}</td>
+                    <td class="timestamp"><span class="expand-indicator">▶</span>${timestamp}</td>
+                    <td>${escapeHtml(betData.homeTeam || '-')} vs ${escapeHtml(betData.awayTeam || '-')}</td>
+                    <td>${escapeHtml(marketDisplay)}</td>
+                    <td>${result.order_price ? (1 / result.order_price).toFixed(2) : (betData.coef || '-')}</td>
+                    <td>${(() => {
+                        if (result.order_price && betData.coef && betData.surebet_profit !== null && betData.surebet_profit !== undefined) {
+                            // 1. Вычисляем 1/coef_BK2 из данных парсера: 1/coef_BK2 = 1 - profit/100 - 1/coef_parser
+                            const inv_coef_bk2 = 1 - (betData.surebet_profit / 100) - (1 / parseFloat(betData.coef));
+                            // 2. Реальная прибыль: real_profit = (1 - order_price - 1/coef_BK2) * 100
+                            const real_profit = (1 - result.order_price - inv_coef_bk2) * 100;
+                            return real_profit.toFixed(2) + '%';
+                        }
+                        return betData.surebet_profit ? betData.surebet_profit.toFixed(2) + '%' : '-';
+                    })()}</td>
+                    <td>${escapeHtml(betData.second_bookmaker || '-')}</td>
+                    <td>${escapeHtml(source)}</td>
                     <td><span class="status ${statusClass}">${statusText}</span></td>
                     <td>${betAmountText}</td>
+                    <td><span class="status ${roiClass}" style="${roiClass ? '' : 'color: #6b7280;'}">${roiText}</span></td>
                     <td><span class="status ${resultClass}">${resultText}</span></td>
                 `;
                 
+                // Создаём строку с деталями
+                const detailsRow = document.createElement('tr');
+                detailsRow.classList.add('bet-details-row');
+                detailsRow.dataset.betIndex = index;
+                if (isExpanded) {
+                    detailsRow.classList.add('expanded');
+                }
+                
+                detailsRow.innerHTML = `
+                    <td colspan="11">
+                        <div class="bet-details-content">
+                            <div class="bet-details-grid">
+                                <div class="bet-details-section">
+                                    <h4>📥 Запрос от парсера</h4>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Букмекер:</span>
+                                        <span class="bet-detail-value">${escapeHtml(betData.bookmaker || '-')}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Второй букмекер:</span>
+                                        <span class="bet-detail-value">${escapeHtml(betData.second_bookmaker || '-')}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Команда 1 (homeTeam):</span>
+                                        <span class="bet-detail-value">${escapeHtml(betData.homeTeam || '-')}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Команда 2 (awayTeam):</span>
+                                        <span class="bet-detail-value">${escapeHtml(betData.awayTeam || '-')}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Лига:</span>
+                                        <span class="bet-detail-value">${escapeHtml(betData.league || '-')}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Спорт:</span>
+                                        <span class="bet-detail-value">${escapeHtml(betData.sport || '-')}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Маркет:</span>
+                                        <span class="bet-detail-value">${escapeHtml(betData.market || '-')}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Target:</span>
+                                        <span class="bet-detail-value" style="font-weight: bold; color: #3b82f6;">${escapeHtml(betData.target || '-')}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Pivot:</span>
+                                        <span class="bet-detail-value">${escapeHtml(betData.pivot || '-')}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Режим:</span>
+                                        <span class="bet-detail-value">${escapeHtml(betData.mode || '-')}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Коэф PM (парсер):</span>
+                                        <span class="bet-detail-value">${escapeHtml(betData.coef || '-')}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Коэф ${escapeHtml(betData.second_bookmaker || 'BK2')} (вычисленный):</span>
+                                        <span class="bet-detail-value">${(() => {
+                                            if (betData.coef && betData.surebet_profit !== null && betData.surebet_profit !== undefined) {
+                                                const inv_coef_bk2 = 1 - (betData.surebet_profit / 100) - (1 / parseFloat(betData.coef));
+                                                if (inv_coef_bk2 > 0) {
+                                                    return (1 / inv_coef_bk2).toFixed(2);
+                                                }
+                                            }
+                                            return '-';
+                                        })()}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Прибыль вилки (парсер):</span>
+                                        <span class="bet-detail-value">${betData.surebet_profit ? betData.surebet_profit.toFixed(2) + '%' : '-'}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Источник:</span>
+                                        <span class="bet-detail-value">${escapeHtml(betData.source || '-')}</span>
+                                    </div>
+                                </div>
+                                <div class="bet-details-section">
+                                    <h4>📤 Результат размещения на Polymarket</h4>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Статус:</span>
+                                        <span class="bet-detail-value">${escapeHtml(result.status || '-')}</span>
+                                    </div>
+                                    ${result.polymarket_event ? `
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">🏟️ Событие PM:</span>
+                                        <span class="bet-detail-value" style="color: #0369a1; font-weight: 600;">${escapeHtml(result.polymarket_event)}</span>
+                                    </div>
+                                    ` : ''}
+                                    ${result.polymarket_market ? `
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">📊 Маркет PM:</span>
+                                        <span class="bet-detail-value" style="color: #0369a1;">${escapeHtml(result.polymarket_market)}</span>
+                                    </div>
+                                    ` : ''}
+                                    ${result.selected_outcome ? `
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">🎯 Поставили на:</span>
+                                        <span class="bet-detail-value" style="font-weight: bold; color: #059669; font-size: 14px;">${escapeHtml(result.selected_outcome)}</span>
+                                    </div>
+                                    ` : ''}
+                                    ${result.available_outcomes && result.available_outcomes.length > 0 ? `
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Доступные исходы:</span>
+                                        <span class="bet-detail-value" style="font-size: 12px;">${escapeHtml(result.available_outcomes.join(' / '))}</span>
+                                    </div>
+                                    ` : ''}
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Order ID:</span>
+                                        <span class="bet-detail-value" style="font-size: 11px;">${escapeHtml(result.order_id || '-')}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Market ID:</span>
+                                        <span class="bet-detail-value" style="font-size: 11px;">${escapeHtml(result.market_id || '-')}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Token ID:</span>
+                                        <span class="bet-detail-value" style="font-size: 11px;">${escapeHtml(result.token_id || '-')}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Цена покупки:</span>
+                                        <span class="bet-detail-value">${result.order_price ? result.order_price.toFixed(4) : '-'}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">📈 Коэф Polymarket:</span>
+                                        <span class="bet-detail-value" style="font-weight: bold; color: #059669;">${result.order_price ? (1 / result.order_price).toFixed(2) : '-'}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">💰 Реальная прибыль вилки:</span>
+                                        <span class="bet-detail-value" style="font-weight: bold; color: ${(() => {
+                                            if (result.order_price && betData.coef && betData.surebet_profit !== null && betData.surebet_profit !== undefined) {
+                                                const inv_coef_bk2 = 1 - (betData.surebet_profit / 100) - (1 / parseFloat(betData.coef));
+                                                const real_profit = (1 - result.order_price - inv_coef_bk2) * 100;
+                                                return real_profit > 0 ? '#059669' : '#dc2626';
+                                            }
+                                            return '#6b7280';
+                                        })()};">${(() => {
+                                            if (result.order_price && betData.coef && betData.surebet_profit !== null && betData.surebet_profit !== undefined) {
+                                                const inv_coef_bk2 = 1 - (betData.surebet_profit / 100) - (1 / parseFloat(betData.coef));
+                                                const real_profit = (1 - result.order_price - inv_coef_bk2) * 100;
+                                                return real_profit.toFixed(2) + '%';
+                                            }
+                                            return '-';
+                                        })()}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Размер (shares):</span>
+                                        <span class="bet-detail-value">${result.order_size ? result.order_size.toFixed(2) : '-'}</span>
+                                    </div>
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Сумма ставки:</span>
+                                        <span class="bet-detail-value">${betAmountUsd ? '$' + betAmountUsd.toFixed(2) : '-'}</span>
+                                    </div>
+                                    ${result.reason ? `
+                                    <div class="bet-detail-item">
+                                        <span class="bet-detail-label">Причина:</span>
+                                        <span class="bet-detail-value" style="color: #dc2626;">${escapeHtml(result.reason)}</span>
+                                    </div>
+                                    ` : ''}
+                                </div>
+                            </div>
+                        </div>
+                    </td>
+                `;
+                
+                // Добавляем обработчик клика на строку
+                row.addEventListener('click', () => toggleBetDetails(index, timestamp));
+                
                 tbody.appendChild(row);
+                tbody.appendChild(detailsRow);
             });
+        }
+        
+        function toggleBetDetails(index, timestamp) {
+            const tbody = document.getElementById('bets-table');
+            const row = tbody.querySelector(`.bet-row[data-bet-index="${index}"]`);
+            const detailsRow = tbody.querySelector(`.bet-details-row[data-bet-index="${index}"]`);
+            
+            if (row && detailsRow) {
+                const isExpanded = row.classList.toggle('expanded');
+                detailsRow.classList.toggle('expanded');
+                
+                // Сохраняем состояние в localStorage
+                saveExpandedState(timestamp, isExpanded);
+            }
+        }
+        
+        // Функции для работы с localStorage
+        function getExpandedStates() {
+            try {
+                const stored = localStorage.getItem('expandedBets');
+                return stored ? JSON.parse(stored) : {};
+            } catch (e) {
+                return {};
+            }
+        }
+        
+        function saveExpandedState(timestamp, isExpanded) {
+            try {
+                const states = getExpandedStates();
+                if (isExpanded) {
+                    states[timestamp] = true;
+                } else {
+                    delete states[timestamp];
+                }
+                // Ограничиваем количество сохранённых состояний (последние 50)
+                const keys = Object.keys(states);
+                if (keys.length > 50) {
+                    keys.slice(0, keys.length - 50).forEach(key => delete states[key]);
+                }
+                localStorage.setItem('expandedBets', JSON.stringify(states));
+            } catch (e) {
+                console.warn('Could not save expanded state:', e);
+            }
+        }
+        
+        function isExpandedInStorage(timestamp) {
+            const states = getExpandedStates();
+            return states[timestamp] === true;
         }
         
         function updateLogs(logs) {
@@ -824,8 +1159,8 @@ async def dashboard_page():
         // Загружаем данные при загрузке страницы
         loadData(true);
         
-        // Автообновление каждые 5 секунд (без показа статуса)
-        setInterval(() => loadData(false), 5000);
+        // Автообновление каждую минуту (без показа статуса)
+        setInterval(() => loadData(false), 60000);
     </script>
 </body>
 </html>
@@ -835,14 +1170,41 @@ async def dashboard_page():
 
 @router.get("/api/stats")
 async def get_stats():
-    """API для получения статистики"""
+    """API для получения статистики (все ставки из БД, без фильтрации по позициям)"""
     return log_storage.get_stats()
+
+
+
+@router.get("/api/balance")
+async def get_balance():
+    """API для получения текущего баланса USDC на Polymarket"""
+    # Прямая проверка через Web3 — работает для любого адреса
+    proxy_address = getattr(_settings, 'polymarket_proxy_address', None)
+    if proxy_address and _clob_client:
+        try:
+            balance = _clob_client.get_usdc_balance_direct(proxy_address)
+            if balance is not None:
+                return {"balance": round(balance, 2), "address": proxy_address}
+        except Exception:
+            pass
+
+    # Fallback: через CLOB API
+    if _clob_client and _clob_client.is_available():
+        try:
+            info = _clob_client.get_balance()
+            bal = info.get("balance") if isinstance(info, dict) else info
+            if bal is not None:
+                return {"balance": round(float(bal), 2)}
+        except Exception:
+            pass
+
+    return {"balance": None}
 
 
 @router.get("/api/bets-history")
 async def get_bets_history(limit: int = 100):
-    """API для получения истории ставок"""
-    return log_storage.get_recent_bets(limit)
+    """API для получения последних успешных ставок."""
+    return log_storage.get_recent_bets(limit, status_filter="success")
 
 
 @router.get("/api/logs-history")
@@ -856,6 +1218,28 @@ async def get_profit_data(days: int = 30):
     """API для получения данных профита для графика"""
     return log_storage.get_profit_data(days)
 
+
+@router.get("/api/real-pnl")
+async def get_real_pnl():
+    """Получение реального PnL из Polymarket API"""
+    try:
+        if not _polymarket_client:
+            raise HTTPException(status_code=500, detail="Polymarket client not available")
+        
+        checker = BetStatusChecker(_polymarket_client)
+        real_pnl = await checker.get_real_pnl_from_polymarket()
+        
+        # Также получаем наш расчет из БД
+        stats = log_storage.get_stats()
+        db_profit = stats.get("total_profit", 0.0)
+        
+        return {
+            "polymarket_pnl": real_pnl,
+            "database_profit": db_profit,
+            "difference": round(real_pnl.get("total_pnl", 0) - db_profit, 2) if "error" not in real_pnl else None
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/api/settings")
 async def get_settings():
