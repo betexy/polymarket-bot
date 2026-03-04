@@ -161,6 +161,34 @@ class PolymarketCLOBClient:
         """Проверка доступности CLOB клиента"""
         return CLOB_AVAILABLE and self._initialized and self._client is not None
     
+    def get_best_price(self, token_id: str, side: str = "BUY") -> Optional[float]:
+        """
+        Получение лучшей цены из CLOB order book.
+        Для BUY возвращает best ask (минимальная цена продавца) из order book.
+        """
+        if not self.is_available():
+            return None
+        try:
+            # Используем order book для получения реальной best ask/bid
+            order_book = self._client.get_order_book(token_id)
+            if side.upper() == "BUY" and order_book.asks:
+                # Best ask = минимальная цена среди asks (asks обычно отсортированы по возрастанию)
+                best_ask = min(float(a.price) for a in order_book.asks if a.price)
+                if 0 < best_ask < 1:
+                    logger.info(f"CLOB best ask from order book: {best_ask} (token_id=...{token_id[-10:]})")
+                    return best_ask
+            elif side.upper() == "SELL" and order_book.bids:
+                # Best bid = максимальная цена среди bids
+                best_bid = max(float(b.price) for b in order_book.bids if b.price)
+                if 0 < best_bid < 1:
+                    logger.info(f"CLOB best bid from order book: {best_bid} (token_id=...{token_id[-10:]})")
+                    return best_bid
+            logger.warning(f"No {'asks' if side.upper() == 'BUY' else 'bids'} in order book for token_id=...{token_id[-10:]}")
+            return None
+        except Exception as e:
+            logger.warning(f"Could not get CLOB price from order book: {e}")
+            return None
+
     def create_order(
         self,
         token_id: str,

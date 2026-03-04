@@ -67,7 +67,90 @@ class OrderManager:
             logger.warning(f"Could not load bet counters from DB: {e}")
 
     async def process_bet(self, bet_data: BetData) -> Dict[str, Any]:
-        """Обработка ставки от парсера и размещение ордера"""
+        """Обработка ставки от парсера — wrapper with one consolidated log per signal"""
+        result = await self._process_bet_impl(bet_data)
+        # Log one consolidated summary per signal (skip silently filtered bookmakers)
+        if not result.get("reason", "").startswith("second_bookmaker_not_allowed"):
+            self._log_bet_summary(bet_data, result)
+        return result
+
+    def _log_bet_summary(self, bet_data: BetData, result: Dict[str, Any]):
+        """Build and log one summary line per signal for the dashboard Logs tab."""
+        status = result.get("status", "unknown")
+        reason = result.get("reason", "")
+
+        # Teams
+        teams = f"{bet_data.homeTeam or '?'} vs {bet_data.awayTeam or '?'}"
+
+        # Market + Target
+        market_target = f"{bet_data.market or '?'} {bet_data.target or ''}".strip()
+
+        # Parser coef
+        coef_str = ""
+        if bet_data.coef:
+            profit_part = f" ({bet_data.surebet_profit:.2f}%)" if bet_data.surebet_profit is not None else ""
+            coef_str = f"Coef: {bet_data.coef}{profit_part}"
+
+        # Poly price (from result if available)
+        poly_str = ""
+        poly_price = result.get("poly_price") or result.get("order_price")
+        if poly_price and float(poly_price) > 0:
+            poly_coef = 1.0 / float(poly_price)
+            recalc = result.get("recalc_profit")
+            recalc_part = f" ({recalc:.2f}%)" if recalc is not None else ""
+            poly_str = f" -> Poly: {poly_coef:.2f}{recalc_part}"
+
+        # Source
+        source = bet_data.second_bookmaker or "?"
+
+        # Outcome description
+        if status == "success":
+            amt = None
+            if result.get("order_price") and result.get("order_size"):
+                amt = float(result["order_price"]) * float(result["order_size"])
+            outcome_str = f"Placed ${amt:.2f}" if amt else "Placed"
+        else:
+            outcome_str = reason
+
+        # Build message
+        parts = [teams, market_target]
+        if coef_str:
+            parts.append(f"{coef_str}{poly_str}")
+        parts.append(source)
+        parts.append(outcome_str)
+        message = " | ".join(parts)
+
+        # Level
+        if status == "success":
+            level = "SUCCESS"
+        elif status == "error":
+            level = "ERROR"
+        else:
+            level = "WARNING"
+
+        # Data dict for tooltip / expand
+        data = {
+            "parser_coef": bet_data.coef,
+            "surebet_profit": bet_data.surebet_profit,
+            "second_bookmaker": bet_data.second_bookmaker,
+            "market": bet_data.market,
+            "target": bet_data.target,
+        }
+        if result.get("market_id"):
+            data["market_id"] = result["market_id"]
+        if poly_price:
+            data["poly_price"] = poly_price
+        if result.get("recalc_profit") is not None:
+            data["recalc_profit"] = result["recalc_profit"]
+        if result.get("order_id"):
+            data["order_id"] = result["order_id"]
+        if reason:
+            data["reason"] = reason
+
+        log_storage.add_api_log(message, level, data)
+
+    async def _process_bet_impl(self, bet_data: BetData) -> Dict[str, Any]:
+        """Internal implementation of bet processing"""
         try:
             # Проверка минимальной прибыли
             if bet_data.surebet_profit is not None:
@@ -75,7 +158,6 @@ class OrderManager:
                     logger.info(f"Bet skipped: profit {bet_data.surebet_profit}% < min {self.settings.min_profit_percent}%")
                     result = {"status": "skipped", "reason": "low_profit"}
                     log_storage.add_bet(bet_data.dict(), result)
-                    log_storage.add_api_log(f"Bet skipped: low profit {bet_data.surebet_profit}%", "INFO")
                     return result
             
             # Проверка, что это ставка на Polymarket
@@ -111,32 +193,13 @@ class OrderManager:
                     bet_data.awayTeam = parts[0].strip()
                     logger.info(f"⇄ Teams swapped: '{original_away}' -> home='{bet_data.homeTeam}', away='{bet_data.awayTeam}'")
             
-            # Логируем, что ставка прошла проверку и будет обрабатываться
             logger.info(f"Bet approved for processing: {bet_data.homeTeam} vs {bet_data.awayTeam}, second_bookmaker: {bet_data.second_bookmaker}")
-            log_storage.add_api_log(
-                f"Bet approved: {bet_data.homeTeam} vs {bet_data.awayTeam}",
-                "INFO",
-                {
-                    "bookmaker": bet_data.bookmaker,
-                    "second_bookmaker": bet_data.second_bookmaker,
-                    "market": bet_data.market,
-                    "target": bet_data.target,
-                    "coef": bet_data.coef,
-                    "homeTeam": bet_data.homeTeam,
-                    "awayTeam": bet_data.awayTeam
-                }
-            )
             
             # Подготовка данных
             order_data = self.mapper.prepare_order_data(bet_data)
             
             # Поиск соответствующего market
             logger.info(f"Searching market for: {bet_data.homeTeam} vs {bet_data.awayTeam}, market_type: {bet_data.market}")
-            log_storage.add_api_log(
-                f"Searching market: {bet_data.homeTeam} vs {bet_data.awayTeam}",
-                "INFO",
-                {"market_type": bet_data.market, "target": bet_data.target, "second_bookmaker": bet_data.second_bookmaker}
-            )
             
             market_info = await self._find_market(bet_data, order_data)
             if not market_info:
@@ -145,35 +208,9 @@ class OrderManager:
                 
                 result = {"status": "error", "reason": "market_not_found", "search_query": search_query}
                 log_storage.add_bet(bet_data.dict(), result)
-                log_storage.add_api_log(
-                    f"Market not found: {bet_data.homeTeam} vs {bet_data.awayTeam}",
-                    "WARNING",
-                    {
-                        "second_bookmaker": bet_data.second_bookmaker,
-                        "market_type": bet_data.market,
-                        "sport": bet_data.sport,
-                        "search_query": order_data.get('search_query'),
-                        "api_response": "No matching market found (checked main event and '- More Markets' event)"
-                    }
-                )
                 return result
             
             logger.info(f"Market found: {market_info.get('id')}, title: {market_info.get('title', 'N/A')}")
-            log_storage.add_api_log(
-                f"Market found: {market_info.get('id')}",
-                "SUCCESS",
-                {
-                    "market_id": market_info.get("id"),
-                    "title": market_info.get("title"),
-                    "second_bookmaker": bet_data.second_bookmaker,
-                    "api_response": {
-                        "id": market_info.get("id"),
-                        "title": market_info.get("title"),
-                        "question": market_info.get("question"),
-                        "outcomes": market_info.get("outcomes", [])[:3]  # Первые 3 исхода
-                    }
-                }
-            )
             
             market_id = market_info.get("id")
             event_id = market_info.get("event_id") or market_info.get("conditionId", "").split("_")[0] if market_info.get("conditionId") else ""
@@ -252,45 +289,26 @@ class OrderManager:
                 error_msg = str(e)
                 if any(x in error_msg for x in ["profit_too_low", "price_dropped_too_much", "market_resolved", "no_liquidity"]):
                     logger.warning(f"Bet skipped: {error_msg}")
-                    result = {"status": "skipped", "reason": error_msg}
+                    result = {"status": "skipped", "reason": error_msg, "market_id": market_info.get('id')}
                     log_storage.add_bet(bet_data.dict(), result)
-                    
-                    # Собираем детальную информацию для лога
-                    log_data = {
-                        "market_id": market_info.get('id'),
-                        "original_profit": bet_data.surebet_profit,
-                        "reason": error_msg
-                    }
-                    
-                    # Добавляем детали расчета, если они доступны
+
+                    # Enrich result with poly price info for consolidated log
                     try:
                         parser_price = order_data.get("price")
-                        if parser_price:
-                            parser_coef = 1.0 / parser_price if parser_price > 0 else None
-                            log_data["parser_price"] = parser_price
-                            log_data["parser_coef"] = parser_coef
-                        
                         current_price = self._get_current_price_from_market(market_info, self.mapper.extract_market_outcome(market_info, bet_data))
                         if current_price:
-                            current_coef = 1.0 / current_price if current_price > 0 else None
-                            log_data["current_price"] = current_price
-                            log_data["current_coef"] = current_coef
-                            
-                            # Рассчитываем recalculated_profit для логирования (правильная формула для вилки)
-                            if bet_data.surebet_profit is not None and parser_coef and current_coef:
-                                coef_second_bk = parser_coef * (bet_data.surebet_profit / 100.0 + 1.0)
-                                total_price = 1.0 / coef_second_bk + 1.0 / current_coef
-                                recalculated_profit = (1.0 / total_price - 1.0) * 100.0
-                                log_data["coef_second_bk"] = coef_second_bk
-                                log_data["recalculated_profit"] = round(recalculated_profit, 2)
-                    except Exception as e:
-                        logger.debug(f"Could not extract detailed price info for log: {e}")
-                    
-                    log_storage.add_api_log(
-                        f"Bet skipped: {error_msg}",
-                        "WARNING",
-                        log_data
-                    )
+                            result["poly_price"] = current_price
+                            if bet_data.surebet_profit is not None and parser_price and parser_price > 0:
+                                parser_coef = 1.0 / parser_price
+                                # 1/coef_bk2 = 1 - surebet_profit/100 - 1/coef_parser
+                                inv_coef_second_bk = 1.0 - (bet_data.surebet_profit / 100.0) - (1.0 / parser_coef)
+                                coef_second_bk = 1.0 / inv_coef_second_bk if inv_coef_second_bk > 0 else 0
+                                current_coef = 1.0 / current_price if current_price > 0 else 0
+                                if current_coef > 0 and coef_second_bk > 0:
+                                    total_price = 1.0 / coef_second_bk + 1.0 / current_coef
+                                    result["recalc_profit"] = round((1.0 / total_price - 1.0) * 100.0, 2)
+                    except Exception:
+                        pass
                     return result
                 else:
                     raise
@@ -466,11 +484,6 @@ class OrderManager:
                     "awayTeam": bet_data.awayTeam
                 }
                 log_storage.add_bet(bet_data.dict(), result)
-                log_storage.add_api_log(
-                    f"Bet skipped: could not determine outcome for {bet_data.homeTeam} vs {bet_data.awayTeam}",
-                    "ERROR",
-                    result
-                )
                 return result
             
             logger.info(f"Market info before get_token_id_from_market: has clobTokenIds={bool(market_info.get('clobTokenIds'))}, has tokens={bool(market_info.get('tokens'))}, has outcomeTokens={bool(market_info.get('outcomeTokens'))}")
@@ -518,19 +531,6 @@ class OrderManager:
                     "available_outcomes": available_outcomes
                 }
                 log_storage.add_bet(bet_data.dict(), result)
-                log_storage.add_api_log(
-                    f"Token ID not found for market {market_id}, outcome: {outcome}",
-                    "WARNING",
-                    {
-                        "market_id": market_id,
-                        "outcome": outcome,
-                        "available_outcomes": market_info.get("outcomes", []),
-                        "market_structure": list(market_info.keys())[:10],
-                        "tokens_found": bool(tokens_found),
-                        "tokens_type": type(tokens_found).__name__ if tokens_found else None,
-                        "tokens_count": len(tokens_found) if isinstance(tokens_found, list) else None
-                    }
-                )
                 return result
             
             # Размещение ордера через CLOB API
@@ -541,18 +541,6 @@ class OrderManager:
                 
                 # Логируем информацию о балансе
                 logger.info(f"Balance check: balance={balance_check.get('balance', 0)}, allowance={balance_check.get('allowance', 'unknown')}, required={required_amount}, address={balance_check.get('address', 'unknown')}")
-                log_storage.add_api_log(
-                    f"Balance check before order: balance={balance_check.get('balance', 0)}, required={required_amount}",
-                    "INFO",
-                    {
-                        "address": balance_check.get("address"),
-                        "balance": balance_check.get("balance"),
-                        "allowance": balance_check.get("allowance"),
-                        "required_amount": required_amount,
-                        "has_balance": balance_check.get("has_balance"),
-                        "has_allowance": balance_check.get("has_allowance")
-                    }
-                )
                 
                 # Проверяем баланс (если проверка прошла успешно)
                 if balance_check.get("has_balance") is False:
@@ -566,15 +554,6 @@ class OrderManager:
                         "address": balance_check.get("address")
                     }
                     log_storage.add_bet(bet_data.dict(), result)
-                    log_storage.add_api_log(
-                        f"Order skipped: insufficient balance",
-                        "ERROR",
-                        {
-                            "balance": balance_check.get("balance", 0),
-                            "required": required_amount,
-                            "address": balance_check.get("address")
-                        }
-                    )
                     return result
                 
                 # При использовании Proxy Wallet автоматическое обновление allowance не работает
@@ -584,11 +563,6 @@ class OrderManager:
                     try:
                         self.clob_client.update_balance_allowance()
                         logger.info("Balance allowance updated successfully")
-                        log_storage.add_api_log(
-                            "Balance allowance updated",
-                            "INFO",
-                            {"address": balance_check.get("address")}
-                        )
                     except Exception as allowance_error:
                         logger.warning(f"Failed to update allowance (may not be critical): {allowance_error}")
                         # Продолжаем попытку размещения ордера, т.к. ошибка может быть не критичной
@@ -611,48 +585,146 @@ class OrderManager:
                 except Exception as open_orders_err:
                     logger.warning(f"Could not check open orders (continuing): {open_orders_err}")
                 
-                # Логируем отправку в CLOB API
-                logger.info(f"Sending order to CLOB API: market_id={market_id}, price={order_params['price']}, size={order_params['size']}")
-                log_storage.add_api_log(
-                    f"Sending to CLOB API: {bet_data.homeTeam} vs {bet_data.awayTeam}",
-                    "INFO",
-                    {
-                        "market_id": market_id,
-                        "token_id": token_id,
-                        "price": order_params["price"],
-                        "size": order_params["size"],
-                        "second_bookmaker": bet_data.second_bookmaker
-                    }
-                )
-                
                 try:
-                    order_result = self.clob_client.create_order(
-                        token_id=token_id,
-                        price=order_params["price"],
-                        size=order_params["size"],
-                        side="BUY"  # По умолчанию покупка
-                    )
-                    
-                    order_id = order_result.get("orderID") or order_result.get("order_id") or order_result.get("id")
-                    order_status_from_api = (order_result.get("status") or "").lower()
-                    
-                    logger.info(f"CLOB API Response: order_id={order_id}, status={order_status_from_api}, market_id={market_id}")
-                    
-                    # Если ордер не исполнен (live) — сразу отменяем и не сохраняем. Важна цена в моменте, не потом.
-                    if order_status_from_api == "live":
-                        logger.info(f"Order not filled (status=live), cancelling immediately: {order_id}")
-                        try:
-                            self.clob_client.cancel_order(order_id)
-                            logger.info(f"Order cancelled: {order_id}")
-                        except Exception as cancel_err:
-                            logger.warning(f"Failed to cancel order {order_id}: {cancel_err}")
-                        return {
-                            "status": "skipped",
-                            "reason": "order_not_filled_immediately",
-                            "order_id": order_id,
-                            "market_id": market_id,
-                            "message": "Order was live (0 filled), cancelled — only placing at parser price in the moment.",
-                        }
+                    # Получаем реальную цену из CLOB order book (best ask)
+                    # outcomePrices из Gamma API — средняя/последняя цена, по ней ордер может не заматчиться
+                    import asyncio as _asyncio_wait
+
+                    MAX_ORDER_ATTEMPTS = 3  # макс. попыток разместить ордер по следующему тику
+                    WAIT_TIMEOUT = 10       # секунд ожидания заполнения за попытку
+                    POLL_INTERVAL = 2       # интервал проверки статуса
+
+                    # Вычисляем coef_second_bk один раз (не зависит от poly цены)
+                    _coef_second_bk = None
+                    if bet_data.surebet_profit is not None and bet_data.coef:
+                        _parser_coef = float(bet_data.coef)
+                        # 1/coef_bk2 = 1 - surebet_profit/100 - 1/coef_parser
+                        _inv = 1.0 - (bet_data.surebet_profit / 100.0) - (1.0 / _parser_coef)
+                        _coef_second_bk = 1.0 / _inv if _inv > 0 else None
+
+                    for attempt in range(1, MAX_ORDER_ATTEMPTS + 1):
+                        # Получаем актуальный best ask
+                        clob_price = self.clob_client.get_best_price(token_id, "BUY")
+                        gamma_price = order_params["price"]
+
+                        if clob_price is not None:
+                            logger.info(f"[Attempt {attempt}/{MAX_ORDER_ATTEMPTS}] Price comparison: gamma_price={gamma_price:.4f}, clob_best_ask={clob_price:.4f}")
+
+                            # Проверяем что с CLOB ценой ставка всё ещё выгодна
+                            if _coef_second_bk and clob_price > 0:
+                                clob_coef = 1.0 / clob_price
+                                total_price = 1.0 / _coef_second_bk + 1.0 / clob_coef
+                                recalc_profit = (1.0 / total_price - 1.0) * 100.0
+                                logger.info(f"Profit with CLOB price: {recalc_profit:.2f}% (clob_coef={clob_coef:.4f})")
+                                if recalc_profit < -0.5:
+                                    logger.warning(f"CLOB price makes bet unprofitable ({recalc_profit:.2f}%), giving up after {attempt} attempt(s)")
+                                    return {"status": "skipped", "reason": f"clob_price_unprofitable: profit={recalc_profit:.2f}% (attempt {attempt})", "poly_price": clob_price, "recalc_profit": round(recalc_profit, 2), "market_id": market_id}
+
+                            # Пробуем поставить на 1 тик выше best ask для лучшего заполнения
+                            aggressive_price = round(clob_price + 0.01, 2)
+                            use_aggressive = False
+                            if aggressive_price <= 0.99 and _coef_second_bk and aggressive_price > 0:
+                                agg_coef = 1.0 / aggressive_price
+                                agg_total = 1.0 / _coef_second_bk + 1.0 / agg_coef
+                                agg_profit = (1.0 / agg_total - 1.0) * 100.0
+                                if agg_profit >= -0.5:
+                                    use_aggressive = True
+                                    logger.info(f"Using aggressive price {aggressive_price:.4f} (+1 tick above ask {clob_price:.4f}), profit={agg_profit:.2f}%")
+                                else:
+                                    logger.info(f"Aggressive price {aggressive_price:.4f} too expensive (profit={agg_profit:.2f}%), using best ask {clob_price:.4f}")
+
+                            final_price = aggressive_price if use_aggressive else clob_price
+                            order_params["price"] = final_price
+                            bet_amount_usd = get_settings_service().get_bet_amount()
+                            order_params["size"] = max(5.0, bet_amount_usd / final_price)
+                        else:
+                            if attempt > 1:
+                                logger.warning("Could not get CLOB price on retry, giving up")
+                                return {"status": "skipped", "reason": "clob_price_unavailable_on_retry", "market_id": market_id}
+                            logger.warning("Could not get CLOB price, using Gamma API price")
+
+                        logger.info(f"[Attempt {attempt}] Sending order to CLOB API: market_id={market_id}, price={order_params['price']}, size={order_params['size']}")
+
+                        order_result = self.clob_client.create_order(
+                            token_id=token_id,
+                            price=order_params["price"],
+                            size=order_params["size"],
+                            side="BUY"
+                        )
+
+                        order_id = order_result.get("orderID") or order_result.get("order_id") or order_result.get("id")
+                        order_status_from_api = (order_result.get("status") or "").lower()
+
+                        logger.info(f"CLOB API Response: order_id={order_id}, status={order_status_from_api}, market_id={market_id}")
+
+                        # Если сразу matched — выходим из цикла
+                        if order_status_from_api == "matched":
+                            break
+
+                        # Если ордер live — ждём до WAIT_TIMEOUT секунд
+                        if order_status_from_api == "live":
+                            logger.info(f"Order is live, waiting up to {WAIT_TIMEOUT}s for fill: {order_id}")
+
+                            filled = False
+                            final_status = "live"
+                            elapsed = 0
+                            while elapsed < WAIT_TIMEOUT:
+                                await _asyncio_wait.sleep(POLL_INTERVAL)
+                                elapsed += POLL_INTERVAL
+                                try:
+                                    check_info = self.clob_client.get_order(order_id)
+                                    final_status = (check_info.get("status") or "").upper()
+                                    logger.info(f"Order {order_id} status after {elapsed}s: {final_status}")
+                                    if final_status == "MATCHED":
+                                        filled = True
+                                        break
+                                    elif final_status not in ("LIVE", ""):
+                                        logger.info(f"Order {order_id} reached terminal status: {final_status}")
+                                        break
+                                except Exception as poll_err:
+                                    logger.warning(f"Error polling order {order_id} status: {poll_err}")
+
+                            if filled:
+                                logger.info(f"Order filled after {elapsed}s wait (attempt {attempt}): {order_id}")
+                                order_status_from_api = "matched"
+                                break
+                            else:
+                                # Не заполнен — отменяем и пробуем следующий тик
+                                try:
+                                    self.clob_client.cancel_order(order_id)
+                                    logger.info(f"Order cancelled: {order_id}")
+                                except Exception as cancel_err:
+                                    logger.warning(f"Failed to cancel order {order_id}: {cancel_err}")
+
+                                if attempt < MAX_ORDER_ATTEMPTS:
+                                    next_ask = None
+                                    try:
+                                        next_ask = self.clob_client.get_best_price(token_id, "BUY")
+                                    except Exception:
+                                        pass
+                                    logger.info(f"[Attempt {attempt}] Not filled (our={order_params['price']:.4f}). Next best ask={next_ask}. Retrying...")
+                                    continue
+                                else:
+                                    # Все попытки исчерпаны
+                                    current_best_ask = None
+                                    try:
+                                        current_best_ask = self.clob_client.get_best_price(token_id, "BUY")
+                                    except Exception:
+                                        pass
+                                    our_price = order_params.get("price")
+                                    reason_parts = [f"order_not_filled ({attempt} attempts)"]
+                                    if current_best_ask is not None and our_price:
+                                        reason_parts.append(f"our={our_price:.4f}, ask={current_best_ask:.4f}")
+                                    return {
+                                        "status": "skipped",
+                                        "reason": ", ".join(reason_parts),
+                                        "order_id": order_id,
+                                        "market_id": market_id,
+                                        "poly_price": current_best_ask or our_price,
+                                    }
+                        else:
+                            # Неожиданный статус (не live, не matched) — не ретраим
+                            break
                     
                     # Только matched — сохраняем в БД и продолжаем
                     logger.info(f"Order placed successfully (matched): order_id={order_id}, market_id={market_id}")
@@ -728,15 +800,6 @@ class OrderManager:
                                 log_storage.stats["successful_orders"] = max(0, log_storage.stats["successful_orders"] - 1)
                                 log_storage.stats["total_bets"] = max(0, log_storage.stats["total_bets"] - 1)
                             
-                            log_storage.add_api_log(
-                                f"Order removed from database: status={order_status}",
-                                "WARNING",
-                                {
-                                    "order_id": order_id,
-                                    "status": order_status,
-                                    "reason": "invalid_order_status"
-                                }
-                            )
                         else:
                             # Заказ валиден, увеличиваем счетчики
                             if market_id:
@@ -754,18 +817,6 @@ class OrderManager:
                         if event_id:
                             self._bets_per_match[event_id] = self._bets_per_match.get(event_id, 0) + 1
                     
-                    log_storage.add_api_log(
-                        f"Order placed successfully via CLOB API: order_id={order_id}",
-                        "SUCCESS",
-                        {
-                            "order_id": order_id,
-                            "market_id": market_id,
-                            "second_bookmaker": bet_data.second_bookmaker,
-                            "price": order_params["price"],
-                            "size": order_params["size"],
-                            "clob_api_response": order_result
-                        }
-                    )
                     return result
                     
                 except Exception as e:
@@ -779,17 +830,6 @@ class OrderManager:
                         "error_type": type(e).__name__
                     }
                     log_storage.add_bet(bet_data.dict(), result)
-                    log_storage.add_api_log(
-                        f"Order placement failed via CLOB API: {error_details}",
-                        "ERROR",
-                        {
-                            "market_id": market_id,
-                            "token_id": token_id,
-                            "error": error_details,
-                            "error_type": type(e).__name__,
-                            "second_bookmaker": bet_data.second_bookmaker
-                        }
-                    )
                     return result
             else:
                 # CLOB клиент не доступен - только информация о market
@@ -807,16 +847,6 @@ class OrderManager:
                     "note": "Market found and token_id extracted, but CLOB client not available for order placement. Install py-clob-client and configure private key to place orders."
                 }
                 log_storage.add_bet(bet_data.dict(), result)
-                log_storage.add_api_log(
-                    f"Order skipped: CLOB client not available",
-                    "WARNING",
-                    {
-                        "market_id": market_id,
-                        "token_id": token_id,
-                        "reason": "CLOB client not installed or not configured",
-                        "note": "Install py-clob-client and configure private key"
-                    }
-                )
                 return result
             
         except Exception as e:
@@ -856,8 +886,7 @@ class OrderManager:
         """Поиск соответствующего market в Polymarket по названиям команд"""
         try:
             import json as json_lib
-            from app.services.logger_service import log_storage
-            
+
             # Генерируем поисковый запрос для события
             search_query = self.mapper.generate_search_query(bet_data)
             home_team_raw = bet_data.homeTeam or ""
@@ -925,11 +954,6 @@ class OrderManager:
             
             if not events:
                 logger.warning(f"No events found for teams: {all_teams}")
-                log_storage.add_api_log(
-                    f"Event search: no events found",
-                    "WARNING",
-                    {"search_query": search_query, "home_team": home_team_raw, "away_team": away_team_raw, "extracted_teams": all_teams}
-                )
                 return None
             
             logger.info(f"Found {len(events)} total events, filtering by teams...")
@@ -979,17 +1003,6 @@ class OrderManager:
                 logger.warning(f"   Searched {len(events)} events, teams: {all_teams}")
                 if events:
                     logger.warning(f"   Sample event titles: {[e.get('title', 'N/A')[:50] for e in events[:5]]}")
-                log_storage.add_api_log(
-                    f"Event search: no matching event for {home_team_raw} vs {away_team_raw}",
-                    "WARNING",
-                    {
-                        "home_team": home_team_raw, 
-                        "away_team": away_team_raw, 
-                        "extracted_teams": all_teams,
-                        "events_found": len(events),
-                        "sample_events": [{"id": e.get('id'), "title": e.get('title', '')[:60]} for e in events[:5]] if events else []
-                    }
-                )
                 return None
             
             event_id = matching_event.get('id')
@@ -1006,11 +1019,6 @@ class OrderManager:
             
             if not markets:
                 logger.warning(f"No markets found for event {event_id}")
-                log_storage.add_api_log(
-                    f"Market search: no markets for event {event_id}",
-                    "WARNING",
-                    {"event_id": event_id, "event_title": matching_event.get('title', '')[:60]}
-                )
                 return None
             
             logger.info(f"Found {len(markets)} markets for event {event_id}")
@@ -1099,19 +1107,6 @@ class OrderManager:
                 matching_market["event_id"] = event_id
                 matching_market["event_title"] = matching_event.get('title', '')  # Название события для дашборда
                 
-                log_storage.add_api_log(
-                    f"Market found: {market_id}",
-                    "SUCCESS",
-                    {
-                        "event_id": event_id,
-                        "market_id": market_id,
-                        "market_title": matching_market.get("title"),
-                        "market_question": matching_market.get("question"),
-                        "market_type": market_type,
-                        "target": target,
-                        "pivot": pivot
-                    }
-                )
                 return matching_market
             else:
                 # Маркет не найден в основном событии
@@ -1209,19 +1204,6 @@ class OrderManager:
                                 matching_market["event_id"] = more_event_id
                                 matching_market["event_title"] = more_markets_event.get('title', '')  # Название события для дашборда
                                 
-                                log_storage.add_api_log(
-                                    f"Market found in '- More Markets': {market_id}",
-                                    "SUCCESS",
-                                    {
-                                        "event_id": more_event_id,
-                                        "market_id": market_id,
-                                        "market_question": matching_market.get("question"),
-                                        "market_type": market_type,
-                                        "target": target,
-                                        "pivot": pivot,
-                                        "source": "More Markets event"
-                                    }
-                                )
                                 return matching_market
                             else:
                                 logger.warning(f"No matching market in '- More Markets' event either")
@@ -1230,33 +1212,10 @@ class OrderManager:
                 logger.warning(f"   Event ID: {event_id}, Markets available: {len(markets)}")
                 if markets:
                     logger.warning(f"   Sample market questions: {[m.get('question', m.get('title', 'N/A'))[:60] for m in markets[:5]]}")
-                log_storage.add_api_log(
-                    f"Market search: no matching market",
-                    "WARNING",
-                    {
-                        "event_id": event_id,
-                        "event_title": matching_event.get('title', '')[:60] if matching_event else None,
-                        "market_type": market_type,
-                        "target": target,
-                        "pivot": pivot,
-                        "markets_count": len(markets),
-                        "sample_markets": [{"id": m.get('id'), "question": m.get('question', m.get('title', ''))[:60]} for m in markets[:5]] if markets else [],
-                        "note": "Also checked '- More Markets' event"
-                    }
-                )
                 return None
             
         except Exception as e:
             logger.error(f"Error finding market: {e}", exc_info=True)
-            from app.services.logger_service import log_storage
-            log_storage.add_api_log(
-                f"Market search error: {str(e)}",
-                "ERROR",
-                {
-                    "error": str(e),
-                    "error_type": type(e).__name__
-                }
-            )
             return None
     
     def _calculate_order_params(
@@ -1273,6 +1232,23 @@ class OrderManager:
         current_price = self._get_current_price_from_market(market_info, outcome)
         parser_price = order_data["price"]  # Цена из коэффициента парсера
 
+        # Защита от перепутанного outcome: если current_price + parser_price ≈ 1.0,
+        # значит мы смотрим на противоположный outcome. Переключаемся на правильный.
+        if current_price is not None and parser_price is not None and parser_price > 0:
+            sum_prices = current_price + parser_price
+            if abs(sum_prices - 1.0) < 0.05 and abs(current_price - parser_price) > 0.15:
+                opposite_price = 1.0 - current_price
+                logger.warning(
+                    f"Detected wrong outcome! current_price={current_price:.4f} looks like opposite side "
+                    f"(parser_price={parser_price:.4f}, sum={sum_prices:.4f}≈1.0). "
+                    f"Flipping to correct price={opposite_price:.4f}"
+                )
+                opposite_outcome = self._get_opposite_outcome(market_info, outcome)
+                if opposite_outcome:
+                    logger.warning(f"Switching outcome: '{outcome}' → '{opposite_outcome}'")
+                    outcome = opposite_outcome
+                current_price = opposite_price
+
         # Проверка на "невозможную" цену (маркет уже разрешён или без ликвидности)
         if current_price is not None:
             if current_price >= 0.99:
@@ -1282,36 +1258,15 @@ class OrderManager:
                 logger.warning(f"Current price {current_price} <= 0.01 - market likely resolved (this outcome lost)")
                 raise ValueError(f"market_resolved_outcome_lost: current_price={current_price:.4f} (price=0.0 means this outcome lost)")
 
-        # Проверка: нельзя ставить ставку, если текущий кэф меньше парсеровского более чем на 0.03
-        # Размещаем если current_coef >= parser_coef - 0.03
-        # Не размещаем если current_coef < parser_coef - 0.03
-        if current_price is not None and parser_price is not None and parser_price > 0:
-            parser_coef = 1.0 / parser_price
-            current_coef = 1.0 / current_price if current_price > 0 else 0
-            
-            if current_coef > 0:
-                # Размещаем только если текущий кэф не меньше чем парсеровский минус 0.03
-                min_allowed_coef = parser_coef - 0.03
-                if current_coef < min_allowed_coef:
-                    logger.warning(
-                        f"Current coefficient too low: parser_coef={parser_coef:.4f} (price={parser_price:.4f}), "
-                        f"current_coef={current_coef:.4f} (price={current_price:.4f}), "
-                        f"min_allowed_coef={min_allowed_coef:.4f}, diff={parser_coef - current_coef:.4f} (>0.03)"
-                    )
-                    raise ValueError(
-                        f"price_dropped_too_much: parser_coef={parser_coef:.4f}, "
-                        f"current_coef={current_coef:.4f}, min_allowed={min_allowed_coef:.4f} "
-                        f"(current_coef is {parser_coef - current_coef:.4f} less than parser_coef, >0.03)"
-                    )
-        
         # Проверяем, не изменился ли коэффициент (цена) на Polymarket
         if current_price is not None and parser_price is not None and bet_data.surebet_profit is not None:
             # Вычисляем коэффициент второй БК из surebet_profit
             # Для вилки: profit = (1 / (1/coef_second + 1/coef_polymarket) - 1) * 100
             # Откуда: 1/coef_second = (1 + profit/100) * 1/coef_polymarket - 1/coef_polymarket
-            # Но проще: из исходной вилки знаем coef_second относительно parser_coef
+            # 1/coef_bk2 = 1 - surebet_profit/100 - 1/coef_parser
             parser_coef = 1.0 / parser_price if parser_price > 0 else 0
-            coef_second_bk = parser_coef * (bet_data.surebet_profit / 100.0 + 1.0)
+            inv_coef_second_bk = 1.0 - (bet_data.surebet_profit / 100.0) - parser_price
+            coef_second_bk = 1.0 / inv_coef_second_bk if inv_coef_second_bk > 0 else 0
             
             # Получаем текущий коэффициент на Polymarket
             current_coef = 1.0 / current_price if current_price > 0 else 0
@@ -1330,11 +1285,8 @@ class OrderManager:
                           f"recalculated_profit={recalculated_profit:.2f}%")
                 
                 # Стандартная проверка прибыли
-                if recalculated_profit < -5.0:
-                    logger.warning(f"Recalculated profit {recalculated_profit:.2f}% < -5%, skipping bet (price changed too much)")
-                    raise ValueError(f"profit_too_low: recalculated_profit={recalculated_profit:.2f}% (price changed significantly)")
-                elif recalculated_profit < -0.5:
-                    logger.warning(f"Recalculated profit {recalculated_profit:.2f}% < -0.5%, skipping bet")
+                if recalculated_profit < -1.0:
+                    logger.warning(f"Recalculated profit {recalculated_profit:.2f}% < -1%, skipping bet")
                     raise ValueError(f"profit_too_low: recalculated_profit={recalculated_profit:.2f}%")
                 else:
                     logger.info(f"Recalculated profit {recalculated_profit:.2f}% >= -0.5%, placing bet with current price")
