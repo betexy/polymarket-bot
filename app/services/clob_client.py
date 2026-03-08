@@ -1,5 +1,6 @@
 import logging
-from typing import Optional, Dict, Any
+import random
+from typing import Optional, Dict, Any, List
 from app.config.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -37,61 +38,90 @@ class PolymarketCLOBClient:
         self.settings = settings
         self._client: Optional[ClobClient] = None
         self._initialized = False
-        
+        self._proxy_list: List[str] = []
+        self._current_proxy_idx: int = 0
+
         if not CLOB_AVAILABLE:
             logger.error("py-clob-client not available. Install with: pip install py-clob-client")
             return
-        
+
         if not settings.polymarket_private_key:
             logger.warning("Private key not configured. CLOB client will not be initialized.")
             return
-        
+
+        # Парсим список прокси
+        self._parse_proxy_list()
+
         # Настраиваем прокси для HTTP клиента py-clob-client
         self._setup_proxy()
-        
+
         self._initialize_client()
-    
-    def _setup_proxy(self) -> None:
-        """Настройка прокси для py-clob-client HTTP клиента"""
-        if not CLOB_AVAILABLE:
-            return
-            
+
+    def _parse_proxy_list(self) -> None:
+        """Парсинг списка прокси из настроек (через запятую)"""
         if not self.settings.polymarket_clob_proxy:
-            logger.info("No proxy configured for CLOB API")
             return
-        
-        try:
-            # Форматируем прокси URL
-            proxy_url = self.settings.polymarket_clob_proxy
-            if not proxy_url.startswith('http://') and not proxy_url.startswith('https://'):
-                # Если формат username:password@host:port, добавляем http://
-                if '@' in proxy_url:
-                    proxy_url = f"http://{proxy_url}"
+
+        raw = self.settings.polymarket_clob_proxy.strip()
+        for entry in raw.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            # Формат: user:pass@host:port -> socks5://user:pass@host:port
+            if not entry.startswith("socks5://"):
+                if "@" in entry:
+                    entry = f"socks5://{entry}"
                 else:
-                    proxy_url = f"http://{proxy_url}"
-            
-            logger.info(f"Setting up proxy for CLOB API: {proxy_url.split('@')[1] if '@' in proxy_url else proxy_url}")
-            
-            # Патчим глобальный httpx клиент в py-clob-client
-            # py-clob-client использует глобальный _http_client = httpx.Client(http2=True)
-            # Пересоздаем его с прокси
+                    entry = f"socks5://{entry}"
+            self._proxy_list.append(entry)
+
+        if self._proxy_list:
+            random.shuffle(self._proxy_list)
+            logger.info(f"Loaded {len(self._proxy_list)} SOCKS5 proxies for CLOB API")
+
+    def _get_current_proxy(self) -> Optional[str]:
+        """Текущий прокси из списка"""
+        if not self._proxy_list:
+            return None
+        return self._proxy_list[self._current_proxy_idx % len(self._proxy_list)]
+
+    def rotate_proxy(self) -> Optional[str]:
+        """Переключение на следующий прокси при ошибке"""
+        if not self._proxy_list:
+            return None
+        self._current_proxy_idx = (self._current_proxy_idx + 1) % len(self._proxy_list)
+        new_proxy = self._get_current_proxy()
+        logger.info(f"Rotating to next proxy: {new_proxy.split('@')[1] if '@' in new_proxy else new_proxy}")
+        self._apply_proxy(new_proxy)
+        return new_proxy
+
+    def _apply_proxy(self, proxy_url: str) -> None:
+        """Применение прокси к httpx клиенту py-clob-client"""
+        try:
             old_client = http_helpers._http_client
             http_helpers._http_client = httpx.Client(
-                http2=True,
-                proxy=proxy_url,  # httpx использует proxy (единственное число)
+                proxy=proxy_url,
                 timeout=30.0
             )
-            
-            # Закрываем старый клиент
             try:
                 old_client.close()
             except:
                 pass
-            
-            logger.info("Proxy configured successfully for CLOB API")
-            
+            logger.info(f"Proxy applied: {proxy_url.split('@')[1] if '@' in proxy_url else proxy_url}")
         except Exception as e:
-            logger.error(f"Failed to setup proxy: {e}", exc_info=True)
+            logger.error(f"Failed to apply proxy: {e}", exc_info=True)
+
+    def _setup_proxy(self) -> None:
+        """Настройка прокси для py-clob-client HTTP клиента"""
+        if not CLOB_AVAILABLE:
+            return
+
+        proxy_url = self._get_current_proxy()
+        if not proxy_url:
+            logger.info("No proxy configured for CLOB API")
+            return
+
+        self._apply_proxy(proxy_url)
     
     def _initialize_client(self) -> None:
         """Инициализация CLOB клиента"""
@@ -276,6 +306,11 @@ class PolymarketCLOBClient:
                 return {"orderID": order_id, "response": str(response)} if order_id else {"response": str(response)}
             
         except Exception as e:
+            error_msg = str(e)
+            # Ротация прокси при гео-блокировке или сетевой ошибке
+            if self._proxy_list and ("Trading restricted" in error_msg or "Request exception" in error_msg or "ProxyError" in error_msg):
+                logger.warning(f"Proxy issue detected, rotating proxy...")
+                self.rotate_proxy()
             logger.error(f"Error creating order: {e}", exc_info=True)
             raise
     
@@ -333,6 +368,9 @@ class PolymarketCLOBClient:
         try:
             return self._client.get_orders()
         except Exception as e:
+            error_msg = str(e)
+            if self._proxy_list and ("Trading restricted" in error_msg or "Request exception" in error_msg or "ProxyError" in error_msg):
+                self.rotate_proxy()
             logger.error(f"Error getting orders: {e}", exc_info=True)
             raise
     

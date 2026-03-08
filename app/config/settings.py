@@ -22,8 +22,8 @@ class Settings(BaseSettings):
     polymarket_builder_secret: Optional[str] = None
     polymarket_builder_passphrase: Optional[str] = None
 
-    # Прокси для CLOB API (формат: username:password@host:port или http://username:password@host:port)
-    polymarket_clob_proxy: Optional[str] = "af8bUp:et9yg5VYr5Ud@mproxy.site:14470"
+    # Прокси для CLOB API (список SOCKS5 прокси через запятую, формат: user:pass@host:port)
+    polymarket_clob_proxy: Optional[str] = None
     
     # API сервер для приема ставок
     api_host: str = "0.0.0.0"
